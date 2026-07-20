@@ -66,6 +66,8 @@ def is_range_error(code: int, message: str) -> bool:
         "response size exceeded",
         "block range",
         "too many results",
+        "too many logs",
+        "max logs per response",
         "limit exceeded",
         "please limit",
         "request timed out",
@@ -84,7 +86,10 @@ class RpcClient:
     ) -> None:
         self.url = url
         self.chain_key = chain_key
-        self.transport = transport or CurlTransport()
+        # Give the transport the full request budget (dense eth_getLogs ranges return
+        # ~20k logs and can legitimately take tens of seconds); the default 30s is too
+        # tight and produces spurious curl(28) timeouts on large responses.
+        self.transport = transport or CurlTransport(timeout=request_timeout)
         self._ids = itertools.count(1)
         self._semaphore = asyncio.Semaphore(concurrency)
         self.request_timeout = request_timeout
@@ -96,20 +101,21 @@ class RpcClient:
         payload = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
         with REQUEST_LATENCY.labels("rpc", self.chain_key).time():
             async with self._semaphore:
-                # Hard ceiling above the transport timeout: a provider that accepts
-                # the connection but never responds must raise (retryable) rather
-                # than park the scan coroutine forever holding a semaphore slot.
+                # Hard ceiling ABOVE the transport's own timeout: the transport should
+                # normally time out first with a clean retryable error; this backstop
+                # only fires if the connection hangs in a way curl's timeout misses, so
+                # the scan coroutine cannot park forever holding a semaphore slot.
                 response = await asyncio.wait_for(
                     self.transport.request("POST", self.url, json=payload),
-                    timeout=self.request_timeout,
+                    timeout=self.request_timeout + 30,
                 )
-        if response.status != 200:
-            RPC_REQUESTS.labels(self.chain_key, method, str(response.status)).inc()
-            raise RpcError(response.status, response.text[:500])
-        if not isinstance(response.data, dict):
-            RPC_REQUESTS.labels(self.chain_key, method, "invalid").inc()
-            raise RpcError(-1, "invalid JSON-RPC response")
-        if error := response.data.get("error"):
+        # Classify a JSON-RPC error in the body before inspecting the HTTP status:
+        # some providers return range/limit errors (e.g. -32005 "Max logs per response
+        # is 20000") with a 503/400/429 status. eth_getLogs range errors must raise
+        # RpcRangeTooLarge so the scanner halves the range instead of aborting the whole
+        # scan and restarting from the checkpoint with the range reset.
+        error = response.data.get("error") if isinstance(response.data, dict) else None
+        if error is not None:
             code = int(error.get("code", -1))
             message = str(error.get("message", "unknown error"))
             RPC_REQUESTS.labels(self.chain_key, method, str(code)).inc()
@@ -119,6 +125,12 @@ class RpcClient:
                 else RpcError
             )
             raise error_type(code, message, error.get("data"))
+        if response.status != 200:
+            RPC_REQUESTS.labels(self.chain_key, method, str(response.status)).inc()
+            raise RpcError(response.status, response.text[:500])
+        if not isinstance(response.data, dict):
+            RPC_REQUESTS.labels(self.chain_key, method, "invalid").inc()
+            raise RpcError(-1, "invalid JSON-RPC response")
         RPC_REQUESTS.labels(self.chain_key, method, "ok").inc()
         return response.data.get("result")
 
