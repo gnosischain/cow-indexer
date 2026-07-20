@@ -1,0 +1,8 @@
+[
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"target","type":"address"},{"indexed":false,"name":"value","type":"uint256"},{"indexed":false,"name":"selector","type":"bytes4"}],"name":"Interaction","type":"event"},
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":false,"name":"orderUid","type":"bytes"}],"name":"OrderInvalidated","type":"event"},
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":false,"name":"orderUid","type":"bytes"},{"indexed":false,"name":"signed","type":"bool"}],"name":"PreSignature","type":"event"},
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"solver","type":"address"}],"name":"Settlement","type":"event"},
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":false,"name":"sellToken","type":"address"},{"indexed":false,"name":"buyToken","type":"address"},{"indexed":false,"name":"sellAmount","type":"uint256"},{"indexed":false,"name":"buyAmount","type":"uint256"},{"indexed":false,"name":"feeAmount","type":"uint256"},{"indexed":false,"name":"orderUid","type":"bytes"}],"name":"Trade","type":"event"}
+]
+

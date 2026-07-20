@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Canonical CoW trade export row",
+  "type": "object",
+  "required": ["order_uid", "tx_hash", "log_index", "owner", "sell_token", "buy_token", "sell_amount", "buy_amount"],
+  "properties": {
+    "order_uid": {"type": "string"},
+    "tx_hash": {"type": "string"},
+    "log_index": {"type": "integer", "minimum": 0},
+    "block_number": {"type": "integer", "minimum": 0},
+    "block_hash": {"type": "string"},
+    "owner": {"type": "string"},
+    "sell_token": {"type": "string"},
+    "buy_token": {"type": "string"},
+    "sell_amount": {"type": ["string", "integer"]},
+    "buy_amount": {"type": ["string", "integer"]},
+    "fee_amount": {"type": ["string", "integer"]}
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Canonical CoW order lifecycle event export row",
+  "type": "object",
+  "required": ["event_type", "event_timestamp"],
+  "properties": {
+    "event_id": {"type": "string"},
+    "order_uid": {"type": "string"},
+    "owner": {"type": "string"},
+    "event_type": {"type": "string"},
+    "event_timestamp": {"type": ["string", "object"]},
+    "transaction_hash": {"type": "string"},
+    "block_number": {"type": "integer"},
+    "log_index": {"type": "integer"}
+  }
+}
+

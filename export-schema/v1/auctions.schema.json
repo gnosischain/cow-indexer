@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Canonical CoW auction export row",
+  "type": "object",
+  "required": ["auction_id"],
+  "properties": {
+    "auction_id": {"type": "integer", "minimum": 0},
+    "block_number": {"type": "integer", "minimum": 0},
+    "deadline": {"type": ["string", "object", "null"]}
+  }
+}
+

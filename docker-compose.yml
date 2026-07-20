@@ -1,0 +1,31 @@
+x-clickhouse-cloud: &clickhouse-cloud
+  CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:?Set CLICKHOUSE_HOST to the ClickHouse Cloud hostname}
+  CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8443}
+  CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME:?Set CLICKHOUSE_USERNAME}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-cow_indexer}
+  CLICKHOUSE_SECURE: ${CLICKHOUSE_SECURE:-true}
+
+services:
+  migrations:
+    build: .
+    command: ["migrate"]
+    env_file:
+      - path: .env
+        required: false
+    environment: *clickhouse-cloud
+    restart: "no"
+
+  indexer:
+    build: .
+    command: ["continuous", "--chain", "${COW_CHAIN:-gnosis}"]
+    env_file:
+      - path: .env
+        required: false
+    environment: *clickhouse-cloud
+    ports:
+      - "9090:9090"
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    restart: unless-stopped

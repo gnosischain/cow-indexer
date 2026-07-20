@@ -1,0 +1,90 @@
+chains:
+  - key: mainnet
+    chain_id: 1
+    environment: production
+    api_base_url: https://api.cow.fi/mainnet
+    rpc_url_env: COW_RPC_URL_MAINNET
+    deployment_file: deployments/mainnet.json
+    finality_blocks: 20
+    enabled: true
+  - key: gnosis
+    chain_id: 100
+    environment: production
+    api_base_url: https://api.cow.fi/xdai
+    rpc_url_env: COW_RPC_URL_GNOSIS
+    deployment_file: deployments/gnosis.json
+    finality_blocks: 20
+    enabled: true
+  - key: arbitrum_one
+    chain_id: 42161
+    environment: production
+    api_base_url: https://api.cow.fi/arbitrum_one
+    rpc_url_env: COW_RPC_URL_ARBITRUM
+    deployment_file: deployments/arbitrum_one.json
+    finality_blocks: 64
+    enabled: true
+  - key: base
+    chain_id: 8453
+    environment: production
+    api_base_url: https://api.cow.fi/base
+    rpc_url_env: COW_RPC_URL_BASE
+    deployment_file: deployments/base.json
+    finality_blocks: 20
+    enabled: true
+  - key: bnb
+    chain_id: 56
+    environment: production
+    api_base_url: https://api.cow.fi/bnb
+    rpc_url_env: COW_RPC_URL_BNB
+    deployment_file: deployments/bnb.json
+    finality_blocks: 20
+    enabled: true
+  - key: polygon
+    chain_id: 137
+    environment: production
+    api_base_url: https://api.cow.fi/polygon
+    rpc_url_env: COW_RPC_URL_POLYGON
+    deployment_file: deployments/polygon.json
+    finality_blocks: 128
+    enabled: true
+  - key: avalanche
+    chain_id: 43114
+    environment: production
+    api_base_url: https://api.cow.fi/avalanche
+    rpc_url_env: COW_RPC_URL_AVALANCHE
+    deployment_file: deployments/avalanche.json
+    finality_blocks: 20
+    enabled: true
+  - key: linea
+    chain_id: 59144
+    environment: production
+    api_base_url: https://api.cow.fi/linea
+    rpc_url_env: COW_RPC_URL_LINEA
+    deployment_file: deployments/linea.json
+    finality_blocks: 64
+    enabled: true
+  - key: ink
+    chain_id: 57073
+    environment: production
+    api_base_url: https://api.cow.fi/ink
+    rpc_url_env: COW_RPC_URL_INK
+    deployment_file: deployments/ink.json
+    finality_blocks: 64
+    enabled: true
+  - key: plasma
+    chain_id: 9745
+    environment: production
+    api_base_url: https://api.cow.fi/plasma
+    rpc_url_env: COW_RPC_URL_PLASMA
+    deployment_file: deployments/plasma.json
+    finality_blocks: 64
+    enabled: true
+  - key: sepolia
+    chain_id: 11155111
+    environment: testnet
+    api_base_url: https://api.cow.fi/sepolia
+    rpc_url_env: COW_RPC_URL_SEPOLIA
+    deployment_file: deployments/sepolia.json
+    finality_blocks: 20
+    enabled: true
+

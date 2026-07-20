@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Canonical CoW order export row",
+  "type": "object",
+  "required": ["order_uid", "owner", "sell_token", "buy_token", "sell_amount", "buy_amount", "valid_to", "kind", "partially_fillable", "creation_date"],
+  "properties": {
+    "order_uid": {"type": "string", "pattern": "^0x[0-9a-fA-F]{112}$"},
+    "owner": {"type": "string", "pattern": "^0x[0-9a-fA-F]{40}$"},
+    "sell_token": {"type": "string", "pattern": "^0x[0-9a-fA-F]{40}$"},
+    "buy_token": {"type": "string", "pattern": "^0x[0-9a-fA-F]{40}$"},
+    "receiver": {"type": ["string", "null"]},
+    "sell_amount": {"type": ["string", "integer"]},
+    "buy_amount": {"type": ["string", "integer"]},
+    "valid_to": {"type": "integer", "minimum": 0},
+    "app_data_hash": {"type": "string"},
+    "fee_amount": {"type": ["string", "integer"]},
+    "kind": {"enum": ["buy", "sell"]},
+    "partially_fillable": {"type": "boolean"},
+    "creation_date": {"type": ["string", "object"]}
+  }
+}
+

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cow.fi/schemas/indexer-export-manifest-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format_version", "bundle_id", "source", "source_schema_version", "environment", "network", "chain_id", "snapshot_at", "files"],
+  "properties": {
+    "format_version": {"const": 1},
+    "bundle_id": {"type": "string", "format": "uuid"},
+    "source": {"type": "string", "minLength": 1},
+    "source_schema_version": {"type": "string", "minLength": 1},
+    "environment": {"type": "string", "minLength": 1},
+    "network": {"type": "string", "minLength": 1},
+    "chain_id": {"type": "integer", "minimum": 1},
+    "snapshot_at": {"type": "string", "format": "date-time"},
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "orders_created_from": {"type": ["string", "null"], "format": "date-time"},
+        "orders_created_to": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dataset", "path", "rows", "sha256"],
+        "properties": {
+          "dataset": {"enum": ["orders", "order_events", "auctions", "auction_orders", "solver_competitions", "trades", "app_data", "quotes"]},
+          "path": {"type": "string", "minLength": 1},
+          "rows": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}
+        }
+      }
+    }
+  }
+}
+

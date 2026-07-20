@@ -1,0 +1,6 @@
+[
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"components":[{"name":"handler","type":"address"},{"name":"salt","type":"bytes32"},{"name":"staticInput","type":"bytes"}],"indexed":false,"name":"params","type":"tuple"}],"name":"ConditionalOrderCreated","type":"event"},
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":false,"name":"root","type":"bytes32"},{"components":[{"name":"location","type":"uint256"},{"name":"data","type":"bytes"}],"indexed":false,"name":"proof","type":"tuple"}],"name":"MerkleRootSet","type":"event"},
+  {"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":false,"name":"swapGuard","type":"address"}],"name":"SwapGuardSet","type":"event"}
+]
+
