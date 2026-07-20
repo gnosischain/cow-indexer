@@ -4,9 +4,47 @@ import asyncio
 import itertools
 from typing import Any
 
+from eth_abi import decode as abi_decode
+
 from cow_indexer.models import BlockHeader, RpcLog
 from cow_indexer.observability import REQUEST_LATENCY, RPC_REQUESTS
 from cow_indexer.sources.http import CurlTransport, HttpTransport
+
+# ERC-20 zero-argument getter selectors (keccak(signature)[:4]).
+ERC20_NAME = "0x06fdde03"
+ERC20_SYMBOL = "0x95d89b41"
+ERC20_DECIMALS = "0x313ce567"
+
+
+def _decode_erc20_string(data: str) -> str | None:
+    """Decode a name()/symbol() return, tolerating the bytes32 variant (e.g. MKR)."""
+    raw = bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith("0x") else b""
+    if not raw:
+        return None
+    # A real dynamic string is >= 64 bytes (offset + length + data); a 32-byte
+    # return is the fixed bytes32 variant, so skip the string attempt for it.
+    if len(raw) != 32:
+        try:
+            value = abi_decode(["string"], raw)[0]
+            if value:
+                return value
+        except Exception:  # noqa: BLE001 - fall back to the fixed-width variant
+            pass
+    try:
+        text = abi_decode(["bytes32"], raw)[0].rstrip(b"\x00").decode("utf-8", "replace")
+        return text or None
+    except Exception:  # noqa: BLE001 - non-compliant token
+        return None
+
+
+def _decode_erc20_uint(data: str) -> int | None:
+    raw = bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith("0x") else b""
+    if not raw:
+        return None
+    try:
+        return int(abi_decode(["uint256"], raw)[0])
+    except Exception:  # noqa: BLE001 - non-compliant token
+        return None
 
 
 class RpcError(RuntimeError):
@@ -42,12 +80,14 @@ class RpcClient:
         chain_key: str,
         transport: HttpTransport | None = None,
         concurrency: int = 10,
+        request_timeout: float = 60.0,
     ) -> None:
         self.url = url
         self.chain_key = chain_key
         self.transport = transport or CurlTransport()
         self._ids = itertools.count(1)
         self._semaphore = asyncio.Semaphore(concurrency)
+        self.request_timeout = request_timeout
 
     async def close(self) -> None:
         await self.transport.close()
@@ -56,7 +96,13 @@ class RpcClient:
         payload = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
         with REQUEST_LATENCY.labels("rpc", self.chain_key).time():
             async with self._semaphore:
-                response = await self.transport.request("POST", self.url, json=payload)
+                # Hard ceiling above the transport timeout: a provider that accepts
+                # the connection but never responds must raise (retryable) rather
+                # than park the scan coroutine forever holding a semaphore slot.
+                response = await asyncio.wait_for(
+                    self.transport.request("POST", self.url, json=payload),
+                    timeout=self.request_timeout,
+                )
         if response.status != 200:
             RPC_REQUESTS.labels(self.chain_key, method, str(response.status)).inc()
             raise RpcError(response.status, response.text[:500])
@@ -115,3 +161,30 @@ class RpcClient:
     async def get_blocks(self, numbers: set[int]) -> dict[int, BlockHeader]:
         headers = await asyncio.gather(*(self.get_block(number) for number in sorted(numbers)))
         return {header.number: header for header in headers}
+
+    async def eth_call(self, to: str, data: str, block: str = "latest") -> str:
+        result = await self.call("eth_call", [{"to": to, "data": data}, block])
+        return result if isinstance(result, str) else "0x"
+
+    async def _call_getter(self, token: str, selector: str) -> str | None:
+        try:
+            return await self.eth_call(token, selector)
+        except RpcError:
+            return None
+
+    async def fetch_token_metadata(self, token: str) -> dict[str, Any] | None:
+        """Read symbol/name/decimals via eth_call. Returns None if the token
+        answers none of the getters (non-ERC-20 or self-destructed)."""
+        symbol_data = await self._call_getter(token, ERC20_SYMBOL)
+        name_data = await self._call_getter(token, ERC20_NAME)
+        decimals_data = await self._call_getter(token, ERC20_DECIMALS)
+        symbol = _decode_erc20_string(symbol_data) if symbol_data is not None else None
+        name = _decode_erc20_string(name_data) if name_data is not None else None
+        decimals = _decode_erc20_uint(decimals_data) if decimals_data is not None else None
+        if symbol is None and name is None and decimals is None:
+            return None
+        return {
+            "symbol": symbol or "",
+            "name": name or "",
+            "decimals": decimals if decimals is not None else 0,
+        }

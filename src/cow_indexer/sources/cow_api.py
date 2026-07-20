@@ -17,6 +17,18 @@ class CowApiError(RuntimeError):
         self.path = path
 
 
+class CompetitionUnavailable(RuntimeError):
+    """The public API does not (or no longer) serves a competition for this key.
+
+    Raised so the enrichment worker can mark the work item terminally
+    ``unavailable_from_public_api`` instead of retrying or dead-lettering it.
+    """
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"solver competition unavailable from public API: {key}")
+        self.key = key
+
+
 class AsyncRateLimiter:
     def __init__(self, interval_seconds: float) -> None:
         self.interval_seconds = interval_seconds
@@ -58,6 +70,7 @@ class CowApiClient:
         params: dict[str, Any] | None = None,
         json: Any = None,
         allow_404: bool = False,
+        route: str | None = None,
     ) -> Any:
         response: HttpResponse | None = None
         for attempt in range(self.max_attempts):
@@ -66,7 +79,9 @@ class CowApiClient:
                 response = await self.transport.request(
                     method, f"{self.base_url}{path}", params=params, json=json
                 )
-            API_REQUESTS.labels(self.chain_key, path, str(response.status)).inc()
+            # Label with the templated route, not the concrete path, so per-UID /
+            # per-tx URLs do not explode Prometheus series cardinality.
+            API_REQUESTS.labels(self.chain_key, route or path, str(response.status)).inc()
             if 200 <= response.status < 300:
                 return response.data if response.data is not None else response.text
             if allow_404 and response.status == 404:
@@ -89,15 +104,24 @@ class CowApiClient:
 
     async def get_order(self, order_uid: str) -> dict[str, Any] | None:
         uid = normalize_order_uid(order_uid)
-        return await self._request("GET", f"/api/v1/orders/{uid}", allow_404=True)
+        return await self._request(
+            "GET", f"/api/v1/orders/{uid}", allow_404=True, route="/api/v1/orders/{uid}"
+        )
 
     async def get_order_status(self, order_uid: str) -> dict[str, Any] | None:
         uid = normalize_order_uid(order_uid)
-        return await self._request("GET", f"/api/v1/orders/{uid}/status", allow_404=True)
+        return await self._request(
+            "GET",
+            f"/api/v1/orders/{uid}/status",
+            allow_404=True,
+            route="/api/v1/orders/{uid}/status",
+        )
 
     async def get_orders_by_transaction(self, tx_hash: str) -> list[dict[str, Any]]:
         tx = normalize_hash(tx_hash)
-        return await self._request("GET", f"/api/v1/transactions/{tx}/orders")
+        return await self._request(
+            "GET", f"/api/v1/transactions/{tx}/orders", route="/api/v1/transactions/{tx}/orders"
+        )
 
     async def iter_account_orders(
         self, owner: str, *, limit: int = 1000
@@ -109,6 +133,7 @@ class CowApiClient:
                 "GET",
                 f"/api/v1/account/{address}/orders",
                 params={"offset": offset, "limit": limit},
+                route="/api/v1/account/{address}/orders",
             )
             if rows:
                 yield rows
@@ -144,19 +169,32 @@ class CowApiClient:
     async def latest_competition(self) -> dict[str, Any] | None:
         return await self._request("GET", "/api/v2/solver_competition/latest", allow_404=True)
 
-    async def competition_by_transaction(self, tx_hash: str) -> dict[str, Any] | None:
+    async def competition_by_transaction(self, tx_hash: str) -> dict[str, Any]:
         tx = normalize_hash(tx_hash)
-        return await self._request(
-            "GET", f"/api/v2/solver_competition/by_tx_hash/{tx}", allow_404=True
+        result = await self._request(
+            "GET",
+            f"/api/v2/solver_competition/by_tx_hash/{tx}",
+            allow_404=True,
+            route="/api/v2/solver_competition/by_tx_hash/{tx}",
         )
+        if not result:
+            raise CompetitionUnavailable(tx)
+        return result
 
     async def app_data(self, app_data_hash: str) -> dict[str, Any] | None:
         value = normalize_hash(app_data_hash)
-        return await self._request("GET", f"/api/v1/app_data/{value}", allow_404=True)
+        return await self._request(
+            "GET", f"/api/v1/app_data/{value}", allow_404=True, route="/api/v1/app_data/{hash}"
+        )
 
     async def native_price(self, token: str) -> dict[str, Any] | None:
         address = normalize_address(token)
-        return await self._request("GET", f"/api/v1/token/{address}/native_price", allow_404=True)
+        return await self._request(
+            "GET",
+            f"/api/v1/token/{address}/native_price",
+            allow_404=True,
+            route="/api/v1/token/{address}/native_price",
+        )
 
     async def version(self) -> str:
         return str(await self._request("GET", "/api/v1/version"))

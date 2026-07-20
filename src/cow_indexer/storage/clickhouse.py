@@ -15,8 +15,8 @@ from cow_indexer.observability import ROWS_WRITTEN
 from cow_indexer.storage.migrations import migration_files, quote_database, split_sql
 from cow_indexer.utils import (
     canonical_json,
-    normalize_auction_order,
     normalize_address,
+    normalize_auction_order,
     normalize_hash,
     normalize_order_uid,
     parse_datetime,
@@ -27,6 +27,43 @@ from cow_indexer.utils import (
 
 log = structlog.get_logger()
 MAX_REVISION = 2**64 - 1
+# Terminal work status for competitions the public API does not serve; sits just
+# below `done`/`dead` so it wins the ReplacingMergeTree merge and lease_work skips it.
+UNAVAILABLE_REVISION = MAX_REVISION - 2
+
+
+def _winning_solution(solutions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the winning solver-competition solution: prefer the explicit isWinner
+    flag, then ranking==1, else the last entry (historical worst-to-best order)."""
+    if not solutions:
+        return None
+    for solution in solutions:
+        if solution.get("isWinner"):
+            return solution
+    for solution in solutions:
+        if str(solution.get("ranking", "")) == "1":
+            return solution
+    return solutions[-1]
+
+
+def _competition_tx_hashes(payload: dict[str, Any]) -> list[str]:
+    """Extract and normalize all settlement tx hashes for an auction, tolerating the
+    v2 `transactionHashes` array, the legacy singular field, and export snake_case."""
+    raw = payload.get("transactionHashes") or payload.get("transaction_hashes") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not raw:
+        singular = payload.get("transactionHash") or payload.get("transaction_hash")
+        raw = [singular] if singular else []
+    hashes: list[str] = []
+    for value in raw:
+        try:
+            normalized = normalize_hash(value)
+        except (ValueError, TypeError):
+            continue
+        if normalized not in hashes:
+            hashes.append(normalized)
+    return hashes
 
 
 class ClickHouseStore:
@@ -146,11 +183,12 @@ class ClickHouseStore:
             ],
         )
 
-    async def store_event(self, event: DecodedEvent) -> None:
-        now = utcnow()
-        await self._insert(
-            "decoded_events",
-            [
+    def _decoded_event_rows(
+        self, event: DecodedEvent, now: datetime
+    ) -> dict[str, list[dict[str, Any]]]:
+        args = event.args
+        rows: dict[str, list[dict[str, Any]]] = {
+            "decoded_events": [
                 {
                     "environment": event.environment,
                     "chain_id": event.chain_id,
@@ -167,70 +205,60 @@ class ClickHouseStore:
                     "removed": event.removed,
                     "observed_at": now,
                 }
-            ],
-        )
-        args = event.args
+            ]
+        }
         if event.event_name == "Trade":
-            await self._insert(
-                "trades",
-                [
-                    {
-                        "environment": event.environment,
-                        "chain_id": event.chain_id,
-                        "order_uid": normalize_order_uid(args["orderUid"]),
-                        "tx_hash": event.transaction_hash,
-                        "log_index": event.log_index,
-                        "block_number": event.block_number,
-                        "block_hash": event.block_hash,
-                        "block_timestamp": event.block_timestamp,
-                        "owner": normalize_address(args["owner"]),
-                        "sell_token": normalize_address(args["sellToken"]),
-                        "buy_token": normalize_address(args["buyToken"]),
-                        "sell_amount": int(args["sellAmount"]),
-                        "buy_amount": int(args["buyAmount"]),
-                        "fee_amount": int(args["feeAmount"]),
-                        "source": "rpc",
-                        "raw_payload": canonical_json(args),
-                        "observed_at": now,
-                    }
-                ],
-            )
+            rows["trades"] = [
+                {
+                    "environment": event.environment,
+                    "chain_id": event.chain_id,
+                    "order_uid": normalize_order_uid(args["orderUid"]),
+                    "tx_hash": event.transaction_hash,
+                    "log_index": event.log_index,
+                    "block_number": event.block_number,
+                    "block_hash": event.block_hash,
+                    "block_timestamp": event.block_timestamp,
+                    "owner": normalize_address(args["owner"]),
+                    "sell_token": normalize_address(args["sellToken"]),
+                    "buy_token": normalize_address(args["buyToken"]),
+                    "sell_amount": int(args["sellAmount"]),
+                    "buy_amount": int(args["buyAmount"]),
+                    "fee_amount": int(args["feeAmount"]),
+                    "source": "rpc",
+                    "raw_payload": canonical_json(args),
+                    "observed_at": now,
+                }
+            ]
         elif event.event_name == "Settlement":
-            await self._insert(
-                "settlements",
-                [
-                    {
-                        "environment": event.environment,
-                        "chain_id": event.chain_id,
-                        "tx_hash": event.transaction_hash,
-                        "block_number": event.block_number,
-                        "block_hash": event.block_hash,
-                        "block_timestamp": event.block_timestamp,
-                        "solver": normalize_address(args["solver"]),
-                        "log_index": event.log_index,
-                        "observed_at": now,
-                    }
-                ],
-            )
+            rows["settlements"] = [
+                {
+                    "environment": event.environment,
+                    "chain_id": event.chain_id,
+                    "tx_hash": event.transaction_hash,
+                    "block_number": event.block_number,
+                    "block_hash": event.block_hash,
+                    "block_timestamp": event.block_timestamp,
+                    "solver": normalize_address(args["solver"]),
+                    "log_index": event.log_index,
+                    "observed_at": now,
+                }
+            ]
         elif event.event_name == "Interaction":
-            await self._insert(
-                "interactions",
-                [
-                    {
-                        "environment": event.environment,
-                        "chain_id": event.chain_id,
-                        "tx_hash": event.transaction_hash,
-                        "block_number": event.block_number,
-                        "block_hash": event.block_hash,
-                        "block_timestamp": event.block_timestamp,
-                        "log_index": event.log_index,
-                        "target": normalize_address(args["target"]),
-                        "value": int(args["value"]),
-                        "selector": args["selector"],
-                        "observed_at": now,
-                    }
-                ],
-            )
+            rows["interactions"] = [
+                {
+                    "environment": event.environment,
+                    "chain_id": event.chain_id,
+                    "tx_hash": event.transaction_hash,
+                    "block_number": event.block_number,
+                    "block_hash": event.block_hash,
+                    "block_timestamp": event.block_timestamp,
+                    "log_index": event.log_index,
+                    "target": normalize_address(args["target"]),
+                    "value": int(args["value"]),
+                    "selector": args["selector"],
+                    "observed_at": now,
+                }
+            ]
 
         if event.event_name in {
             "OrderInvalidated",
@@ -253,54 +281,78 @@ class ClickHouseStore:
                     event.event_name,
                 ]
             )
-            await self._insert(
-                "order_events",
-                [
-                    {
-                        "event_id": event_id,
-                        "environment": event.environment,
-                        "chain_id": event.chain_id,
-                        "order_uid": normalize_order_uid(uid) if uid else "",
-                        "owner": normalize_address(owner) if owner else "",
-                        "event_type": event.event_name,
-                        "source": "rpc",
-                        "block_number": event.block_number,
-                        "transaction_hash": event.transaction_hash,
-                        "log_index": event.log_index,
-                        "event_timestamp": event.block_timestamp,
-                        "payload": canonical_json(args),
-                        "observed_at": now,
-                    }
-                ],
-            )
+            rows["order_events"] = [
+                {
+                    "event_id": event_id,
+                    "environment": event.environment,
+                    "chain_id": event.chain_id,
+                    "order_uid": normalize_order_uid(uid) if uid else "",
+                    "owner": normalize_address(owner) if owner else "",
+                    "event_type": event.event_name,
+                    "source": "rpc",
+                    "block_number": event.block_number,
+                    "transaction_hash": event.transaction_hash,
+                    "log_index": event.log_index,
+                    "event_timestamp": event.block_timestamp,
+                    "payload": canonical_json(args),
+                    "observed_at": now,
+                }
+            ]
+        return rows
+
+    async def store_event(self, event: DecodedEvent) -> None:
+        await self.store_events([event])
+
+    async def store_events(self, events: list[DecodedEvent]) -> None:
+        """Batch the decoded-event rows for a whole scanned range into one INSERT
+        per target table instead of one INSERT per log."""
+        if not events:
+            return
+        now = utcnow()
+        batches: dict[str, list[dict[str, Any]]] = {}
+        for event in events:
+            for table, rows in self._decoded_event_rows(event, now).items():
+                batches.setdefault(table, []).extend(rows)
+        for table in ("decoded_events", "trades", "settlements", "interactions", "order_events"):
+            if batches.get(table):
+                await self._insert(table, batches[table])
 
     async def enqueue_work(
         self, chain: ChainConfig, kind: str, key: str, payload: dict[str, Any] | None = None
     ) -> None:
-        normalized_key = key.lower()
-        work_id = sha256_json([chain.environment, chain.chain_id, kind, normalized_key])
+        await self.enqueue_work_many(chain, [(kind, key, payload)])
+
+    async def enqueue_work_many(
+        self,
+        chain: ChainConfig,
+        items: Iterable[tuple[str, str, dict[str, Any] | None]],
+    ) -> None:
         now = utcnow()
-        await self._insert(
-            "work_items",
-            [
-                {
-                    "work_id": work_id,
-                    "environment": chain.environment,
-                    "chain_id": chain.chain_id,
-                    "kind": kind,
-                    "key": normalized_key,
-                    "payload": canonical_json(payload or {}),
-                    "status": "pending",
-                    "attempts": 0,
-                    "lease_owner": "",
-                    "lease_until": None,
-                    "next_attempt_at": now,
-                    "error": "",
-                    "revision": 0,
-                    "observed_at": now,
-                }
-            ],
-        )
+        rows: dict[str, dict[str, Any]] = {}
+        for kind, key, payload in items:
+            normalized_key = key.lower()
+            work_id = sha256_json([chain.environment, chain.chain_id, kind, normalized_key])
+            # Dedup within the batch; a range often enqueues the same token / owner
+            # many times. ReplacingMergeTree keeps the highest revision anyway, but a
+            # fresh revision-0 row must not clobber a terminal one, so keep only one
+            # revision-0 row per work_id per batch.
+            rows[work_id] = {
+                "work_id": work_id,
+                "environment": chain.environment,
+                "chain_id": chain.chain_id,
+                "kind": kind,
+                "key": normalized_key,
+                "payload": canonical_json(payload or {}),
+                "status": "pending",
+                "attempts": 0,
+                "lease_owner": "",
+                "lease_until": None,
+                "next_attempt_at": now,
+                "error": "",
+                "revision": 0,
+                "observed_at": now,
+            }
+        await self._insert("work_items", list(rows.values()))
 
     async def checkpoint(self, chain: ChainConfig, block: BlockHeader) -> None:
         current = await self.get_checkpoint(chain)
@@ -520,8 +572,40 @@ class ClickHouseStore:
     ) -> None:
         now = utcnow()
         auction_id = int(payload.get("auctionId", payload.get("auction_id", 0)))
-        transaction_hash = payload.get("transactionHash") or payload.get("transaction_hash") or ""
-        winner = payload.get("winner") or payload.get("winnerAddress") or ""
+        solutions = (
+            payload.get("solutions") or payload.get("competition", {}).get("solutions") or []
+        )
+        winning = _winning_solution(solutions)
+        tx_hashes = _competition_tx_hashes(payload)
+
+        # Winner address comes from the winning solution (v2 has no top-level winner);
+        # fall back to the legacy top-level fields.
+        winner_raw = ""
+        if winning:
+            winner_raw = winning.get("solverAddress") or winning.get("solver") or ""
+        if not winner_raw:
+            winner_raw = payload.get("winner") or payload.get("winnerAddress") or ""
+        winner_tx = ""
+        if winning and winning.get("txHash"):
+            try:
+                winner_tx = normalize_hash(winning["txHash"])
+            except (ValueError, TypeError):
+                winner_tx = ""
+        header_tx = winner_tx or (tx_hashes[0] if tx_hashes else "")
+
+        # reference_score: scalar `referenceScore`, or a per-solver `referenceScores` map.
+        reference_score = payload.get("referenceScore")
+        if reference_score is None and payload.get("referenceScores") is not None:
+            reference_score = canonical_json(payload["referenceScores"])
+        reference_score = str(reference_score) if reference_score is not None else ""
+
+        auction_block = int(
+            payload.get("auctionStartBlock")
+            or payload.get("auction_start_block")
+            or payload.get("auction", {}).get("block", 0)
+            or 0
+        )
+
         await self._insert(
             "solver_competitions",
             [
@@ -529,22 +613,39 @@ class ClickHouseStore:
                     "environment": chain.environment,
                     "chain_id": chain.chain_id,
                     "auction_id": auction_id,
-                    "tx_hash": normalize_hash(transaction_hash) if transaction_hash else "",
-                    "winner": normalize_address(winner) if winner else "",
-                    "reference_score": str(payload.get("referenceScore", "")),
-                    "auction_block": int(payload.get("auction", {}).get("block", 0)),
+                    "tx_hash": header_tx,
+                    "winner": normalize_address(winner_raw) if winner_raw else "",
+                    "reference_score": reference_score,
+                    "auction_block": auction_block,
                     "source": source,
                     "raw_payload": canonical_json(payload),
                     "observed_at": now,
                 }
             ],
         )
-        solutions = (
-            payload.get("solutions") or payload.get("competition", {}).get("solutions") or []
+        await self._insert(
+            "competition_transactions",
+            [
+                {
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "auction_id": auction_id,
+                    "tx_index": index,
+                    "tx_hash": tx_hash,
+                    "source": source,
+                    "observed_at": now,
+                }
+                for index, tx_hash in enumerate(tx_hashes)
+            ],
         )
         solution_rows = []
         for index, solution in enumerate(solutions):
-            solver = solution.get("solver") or solution.get("solverAddress") or ""
+            solver = solution.get("solverAddress") or solution.get("solver") or ""
+            solution_tx = solution.get("txHash") or ""
+            try:
+                solution_tx = normalize_hash(solution_tx) if solution_tx else ""
+            except (ValueError, TypeError):
+                solution_tx = ""
             solution_rows.append(
                 {
                     "environment": chain.environment,
@@ -554,7 +655,8 @@ class ClickHouseStore:
                     "solver": normalize_address(solver) if solver else "",
                     "score": str(solution.get("score", "")),
                     "ranking": int(solution.get("ranking", index + 1)),
-                    "is_winner": bool(solution.get("isWinner", index == 0)),
+                    "is_winner": bool(solution.get("isWinner", solution is winning)),
+                    "tx_hash": solution_tx,
                     "payload": canonical_json(solution),
                     "observed_at": now,
                 }
@@ -683,9 +785,15 @@ class ClickHouseStore:
         success: bool,
         error: str | None = None,
         retry_at: datetime | None = None,
+        terminal: str | None = None,
     ) -> None:
         now = utcnow()
-        if success:
+        if terminal is not None:
+            # Non-error terminal outcome (e.g. unavailable_from_public_api): sticky,
+            # not retried, not dead-lettered.
+            status = terminal
+            revision = UNAVAILABLE_REVISION
+        elif success:
             status = "done"
             revision = MAX_REVISION
         elif retry_at is not None:
@@ -751,8 +859,14 @@ class ClickHouseStore:
             "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
             "UNION DISTINCT "
             f"SELECT buy_token AS token FROM {self.quoted_database}.orders FINAL "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "UNION DISTINCT "
+            f"SELECT sell_token AS token FROM {self.quoted_database}.trades FINAL "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "UNION DISTINCT "
+            f"SELECT buy_token AS token FROM {self.quoted_database}.trades FINAL "
             "WHERE environment={environment:String} AND chain_id={chain_id:UInt64}) "
-            "LIMIT {limit:UInt32}",
+            "WHERE token != '' LIMIT {limit:UInt32}",
             parameters={
                 "environment": chain.environment,
                 "chain_id": chain.chain_id,
@@ -760,6 +874,45 @@ class ClickHouseStore:
             },
         )
         return [row[0] for row in result.result_rows]
+
+    async def tokens_with_metadata(self, chain: ChainConfig) -> list[str]:
+        await self._ensure()
+        result = await self.client.query(
+            f"SELECT DISTINCT token FROM {self.quoted_database}.token_metadata "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64}",
+            parameters={"environment": chain.environment, "chain_id": chain.chain_id},
+        )
+        return [row[0] for row in result.result_rows]
+
+    async def store_token_metadata(
+        self, chain: ChainConfig, token: str, metadata: dict[str, Any], source: str
+    ) -> None:
+        decimals = max(0, min(255, int(metadata.get("decimals", 0) or 0)))
+        await self._insert(
+            "token_metadata",
+            [
+                {
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "token": normalize_address(token),
+                    "symbol": str(metadata.get("symbol", "")),
+                    "name": str(metadata.get("name", "")),
+                    "decimals": decimals,
+                    "source": source,
+                    "observed_at": utcnow(),
+                }
+            ],
+        )
+
+    async def pending_work_count(self, chain: ChainConfig) -> int:
+        await self._ensure()
+        result = await self.client.query(
+            f"SELECT count() FROM {self.quoted_database}.work_items FINAL "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "AND status = 'pending'",
+            parameters={"environment": chain.environment, "chain_id": chain.chain_id},
+        )
+        return int(result.result_rows[0][0]) if result.result_rows else 0
 
     async def import_rows(
         self, manifest: Any, dataset: str, rows: list[dict[str, Any]], bundle_id: str

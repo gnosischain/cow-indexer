@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import Any
 
@@ -7,9 +8,9 @@ import structlog
 
 from cow_indexer.config import ChainConfig, RuntimeConfig
 from cow_indexer.models import WorkItem
-from cow_indexer.sources.cow_api import CowApiClient
+from cow_indexer.sources.cow_api import CompetitionUnavailable, CowApiClient
 from cow_indexer.storage.base import Storage
-from cow_indexer.utils import utcnow
+from cow_indexer.utils import normalize_order_uid, utcnow
 
 log = structlog.get_logger()
 
@@ -21,40 +22,104 @@ class EnrichmentService:
         api: CowApiClient,
         store: Storage,
         runtime: RuntimeConfig,
+        concurrency: int = 8,
     ) -> None:
         self.chain = chain
         self.api = api
         self.store = store
         self.runtime = runtime
+        self.concurrency = concurrency
 
     async def run_once(self, limit: int = 20) -> int:
         items = await self.store.lease_work(self.chain, self.runtime.worker_id, limit)
-        for item in items:
-            try:
-                await self.process(item)
-                await self.store.finish_work(item, True)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                if item.attempts >= self.runtime.max_attempts:
-                    await self.store.finish_work(item, False, error)
-                else:
-                    delay = min(3600, 2**item.attempts)
-                    await self.store.finish_work(
-                        item, False, error, retry_at=utcnow() + timedelta(seconds=delay)
-                    )
-                log.warning(
-                    "enrichment_failed",
-                    chain=self.chain.key,
-                    kind=item.kind,
-                    key=item.key,
-                    attempts=item.attempts,
-                    error=error,
-                )
+        if not items:
+            return 0
+        # Fetch the base orders for every leased order_uid item in one batched
+        # request (get_orders_by_uids chunks at 128) instead of one call per item.
+        prefetched = await self._prefetch_orders(
+            [item.key for item in items if item.kind == "order_uid"]
+        )
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def guarded(item: WorkItem) -> None:
+            async with semaphore:
+                await self._process_and_finish(item, prefetched)
+
+        await asyncio.gather(*(guarded(item) for item in items))
         return len(items)
 
-    async def process(self, item: WorkItem) -> None:
+    async def _prefetch_orders(self, keys: list[str]) -> dict[str, dict[str, Any]] | None:
+        """Batch-fetch base orders for leased order_uid items. Returns a uid->order
+        map on success (absent uid == the order does not exist, like a 404), or None
+        if the batch call fails so each item falls back to a per-item fetch and its
+        own retry/terminal handling."""
+        if not keys:
+            return {}
+        try:
+            orders = await self.api.get_orders_by_uids(keys)
+        except Exception:
+            return None
+        result: dict[str, dict[str, Any]] = {}
+        for order in orders:
+            uid = order.get("uid")
+            if not uid:
+                continue
+            try:
+                result[normalize_order_uid(uid)] = order
+            except ValueError:
+                continue
+        return result
+
+    async def _resolve_order(
+        self, key: str, prefetched: dict[str, dict[str, Any]] | None
+    ) -> dict[str, Any] | None:
+        if prefetched is None:
+            # Batch prefetch failed: fall back to a per-item fetch so this item's own
+            # error (if any) drives its retry/dead-letter path.
+            return await self.api.get_order(key)
+        return prefetched.get(normalize_order_uid(key))
+
+    async def _process_and_finish(
+        self, item: WorkItem, prefetched: dict[str, dict[str, Any]] | None = None
+    ) -> None:
+        try:
+            await self.process(item, prefetched)
+            await self.store.finish_work(item, True)
+        except CompetitionUnavailable as exc:
+            # Not an error: the public API does not serve this competition. Record a
+            # terminal, non-retried classification instead of dead-lettering it.
+            await self.store.finish_work(
+                item, False, error=str(exc), terminal="unavailable_from_public_api"
+            )
+            log.info(
+                "competition_unavailable",
+                chain=self.chain.key,
+                kind=item.kind,
+                key=item.key,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if item.attempts >= self.runtime.max_attempts:
+                await self.store.finish_work(item, False, error)
+            else:
+                delay = min(3600, 2**item.attempts)
+                await self.store.finish_work(
+                    item, False, error, retry_at=utcnow() + timedelta(seconds=delay)
+                )
+            log.warning(
+                "enrichment_failed",
+                chain=self.chain.key,
+                kind=item.kind,
+                key=item.key,
+                attempts=item.attempts,
+                error=error,
+            )
+
+    async def process(
+        self, item: WorkItem, prefetched: dict[str, dict[str, Any]] | None = None
+    ) -> None:
         if item.kind == "order_uid":
-            order = await self.api.get_order(item.key)
+            order = await self._resolve_order(item.key, prefetched)
             await self.store.store_api_payload(self.chain, "order", item.key, order)
             if order:
                 await self.store.store_orders(self.chain, [order], "api")
@@ -79,11 +144,12 @@ class EnrichmentService:
             await self.store.store_orders(self.chain, orders, "api")
             for order in orders:
                 await self._fanout_order(order)
+        elif item.kind == "tx_competition":
+            # Raises CompetitionUnavailable on a 404, handled terminally upstream.
             competition = await self.api.competition_by_transaction(item.key)
             await self.store.store_api_payload(self.chain, "competition:tx", item.key, competition)
-            if competition:
-                await self.store.store_competition(self.chain, competition, "api")
-                await self._fanout_competition(competition)
+            await self.store.store_competition(self.chain, competition, "api")
+            await self._fanout_competition(competition)
         elif item.kind == "app_data":
             payload = await self.api.app_data(item.key)
             await self.store.store_api_payload(self.chain, "app_data", item.key, payload)

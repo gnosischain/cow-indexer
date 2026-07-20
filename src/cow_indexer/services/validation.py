@@ -23,7 +23,7 @@ class ValidationService:
             (
                 "settlements_have_competitions",
                 f"SELECT count() FROM {self.store.quoted_database}.settlements_canonical AS s "
-                f"LEFT JOIN {self.store.quoted_database}.solver_competitions AS c FINAL "
+                f"LEFT JOIN {self.store.quoted_database}.competition_transactions AS c FINAL "
                 "ON s.environment=c.environment AND s.chain_id=c.chain_id AND s.tx_hash=c.tx_hash "
                 "WHERE s.environment={environment:String} AND s.chain_id={chain_id:UInt64} AND c.tx_hash=''",
             ),

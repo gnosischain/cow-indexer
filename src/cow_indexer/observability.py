@@ -9,7 +9,7 @@ from aiohttp import web
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 RPC_REQUESTS = Counter("cow_rpc_requests_total", "RPC requests", ["chain", "method", "status"])
-API_REQUESTS = Counter("cow_api_requests_total", "CoW API requests", ["chain", "path", "status"])
+API_REQUESTS = Counter("cow_api_requests_total", "CoW API requests", ["chain", "route", "status"])
 ROWS_WRITTEN = Counter("cow_rows_written_total", "Rows written", ["chain", "table"])
 CHAIN_LAG = Gauge("cow_chain_lag_blocks", "Safe head minus checkpoint", ["chain"])
 WORK_QUEUE = Gauge("cow_work_queue_items", "Pending work items", ["chain"])

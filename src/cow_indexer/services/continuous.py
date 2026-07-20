@@ -72,9 +72,27 @@ async def run_continuous(
                                     current_chain, "order_uid", normalized[0]
                                 )
 
-                async def enrich_action(service=enrichment, current_chain=chain) -> None:
-                    processed = await service.run_once()
-                    WORK_QUEUE.labels(current_chain.key).set(processed)
+                async def enrich_action(service=enrichment) -> None:
+                    await service.run_once()
+
+                async def queue_depth_action(current_chain=chain) -> None:
+                    WORK_QUEUE.labels(current_chain.key).set(
+                        await store.pending_work_count(current_chain)
+                    )
+
+                async def token_metadata_action(current_chain=chain, current_rpc=rpc) -> None:
+                    have = set(await store.tokens_with_metadata(current_chain))
+                    pending = [
+                        token
+                        for token in await store.known_tokens(current_chain)
+                        if token not in have
+                    ]
+                    for token in pending[:50]:
+                        metadata = await current_rpc.fetch_token_metadata(token)
+                        if metadata is not None:
+                            await store.store_token_metadata(
+                                current_chain, token, metadata, "rpc"
+                            )
 
                 async def active_action(current_chain=chain, current_api=api) -> None:
                     uids = await store.active_order_uids(current_chain)
@@ -95,8 +113,12 @@ async def run_continuous(
                 group.create_task(_resilient_loop("rpc", chain, scan_action, 12.0))
                 group.create_task(_resilient_loop("competition", chain, competition_action, 30.0))
                 group.create_task(_resilient_loop("enrichment", chain, enrich_action, 1.0))
+                group.create_task(_resilient_loop("queue-depth", chain, queue_depth_action, 30.0))
                 group.create_task(_resilient_loop("active-orders", chain, active_action, 60.0))
                 group.create_task(_resilient_loop("token-prices", chain, token_price_action, 300.0))
+                group.create_task(
+                    _resilient_loop("token-metadata", chain, token_metadata_action, 300.0)
+                )
     finally:
         await server.close()
         await asyncio.gather(
