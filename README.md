@@ -58,6 +58,18 @@ COW_RPC_URL_ARBITRUM=https://...
 
 Disable a chain in `config/chains.yaml` when no RPC is available. The API base URLs, finality windows, and deployment files are configured independently per chain.
 
+Set a CoW API key so enrichment is not throttled by CoW's edge. Without one the public edge starts returning `403 Request blocked` under load; the key is sent as `X-API-Key` and raises the allowance to roughly 30 RPS. Enrichment pacing and retry behavior are tunable and are a single global budget shared across all chains:
+
+```dotenv
+COW_API_KEY=...
+COW_API_INTERVAL_SECONDS=0.1   # global pacing; default 0.1 (~10 RPS) with a key, 0.6 without
+COW_API_MAX_INTERVAL_SECONDS=5 # adaptive backoff ceiling on 429/403
+COW_ENRICH_CONCURRENCY=6       # bounded concurrent enrichment work items
+COW_MAX_ATTEMPTS=6             # attempts before a work item is dead-lettered
+```
+
+Before enabling many chains, validate every configured RPC and API endpoint with `preflight` (see below); it is read-only and catches pruned/non-archive nodes before they stall a scan.
+
 Docker Compose does not run a local ClickHouse server. It runs migrations once against ClickHouse Cloud and starts the indexer only after they succeed:
 
 ```bash
@@ -68,6 +80,12 @@ docker compose up -d --build
 The ClickHouse user needs table, view, insert, and select privileges within `CLICKHOUSE_DATABASE`; it does not need account-wide `CREATE DATABASE` permission.
 
 ## Commands
+
+Validate every selected chain's RPC (head plus historical `eth_getLogs` at the deployment block) and CoW API reachability, without touching ClickHouse. It prints a per-chain report and exits non-zero if any chain's RPC path fails — run it before enabling new chains:
+
+```bash
+uv run cow-indexer preflight --chain all
+```
 
 Apply migrations and backfill every enabled network:
 
@@ -103,11 +121,27 @@ uv run cow-indexer coverage --chain all
 uv run cow-indexer validate --chain all
 ```
 
+## Running modes
+
+Each mode is a subcommand of the same binary; they share the ClickHouse schema and the durable checkpoints, so they interleave safely.
+
+| Mode | Command | Purpose |
+| --- | --- | --- |
+| Preflight | `preflight --chain <all\|key>` | Read-only readiness check: RPC head, historical `eth_getLogs` at the deployment block, and CoW API reachability per chain. Run before enabling chains. |
+| Migrate | `migrate` | Apply `migrations/*.sql` (idempotent `CREATE ... IF NOT EXISTS` / `CREATE OR REPLACE VIEW`). Run before any ingestion. |
+| Backfill | `backfill --chain <sel> [--from-block N] [--to-block M]` | One-shot forward scan from the checkpoint (or a bound) up to the safe head, then exit. |
+| Repair | `repair --chain <key> --from-block N --to-block M` | Rescan a bounded range and reconcile reorgs/gaps **without moving the forward checkpoint backward**. |
+| Continuous | `continuous --chain <all\|key>` | Long-running service: forward scan + finality-window rescan + competitions + active orders + enrichment + token prices, per chain. Exposes `:9090`. |
+| Inspect / status | `status`, `coverage --chain <sel>`, `validate --chain <sel>` | Report per-chain checkpoints, historical coverage, and reconciliation checks. |
+| Export import | `inspect-export`, `import-export`, `validate-export` | Optional authoritative off-chain bundle import (see below). |
+
+Typical lifecycle: `preflight` → `migrate` → `continuous` (which backfills from each chain's pinned deployment block up to the tip and then tracks the head). `backfill` and `repair` are for bounded/one-shot work. In `continuous` mode every chain runs independently — a failing chain retries in isolation and does not stop the others. A fresh chain with no checkpoint starts at the earliest pinned `from_block` in its `deployments/*.json`; pin those blocks (not `0`) to avoid scanning from genesis.
+
 ## Historical scan behavior
 
-The scanner starts with 5,000-block `eth_getLogs` requests. Successful ranges grow to 50,000 blocks; provider range/response-limit errors halve the request down to a 50-block minimum. Raw logs, block headers, decoded events, and the checkpoint are committed in that order.
+The scanner starts with 5,000-block `eth_getLogs` requests. Successful ranges grow to 50,000 blocks; provider range/response-limit errors halve the request down to a 50-block minimum. Range/limit errors are recognized by JSON-RPC code and message even when the provider returns them with a non-200 HTTP status (some return `503` for "too many logs"), so they trigger adaptive halving (logged as `rpc_range_reduced`) rather than aborting the scan. Each RPC call has a hard request timeout, so a provider that accepts a connection but never responds raises a retryable error instead of parking the scan. Raw logs and block headers are batched per range; decoded events and enrichment work items are flushed in one insert per table; raw logs, block headers, decoded events, and the checkpoint are committed in that order.
 
-Continuous ingestion stores canonical block hashes throughout the finality window. A replacement block hash makes logs from the abandoned block non-canonical at query/reconciliation time without destructive mutations. Repair scans never move the durable forward checkpoint backward.
+Continuous ingestion stores canonical block hashes throughout the finality window. A replacement block hash makes logs from the abandoned block non-canonical at query/reconciliation time without destructive mutations. The reorg-aware `*_canonical` views are additionally bounded to the committed checkpoint, so they never expose partially-processed or not-yet-committed rows. Repair scans never move the durable forward checkpoint backward.
 
 ## API enrichment
 
@@ -119,9 +153,42 @@ Event discovery creates deterministic work identities for:
 - app-data hashes
 - token addresses
 
-CoW API order lookups are split into the documented maximum of 128 UIDs. Account orders and v2 trades paginate with 1,000-row pages until a short page is received. Retryable HTTP statuses use bounded exponential backoff. `curl_cffi` browser TLS impersonation is used because CoW's edge can distinguish ordinary Python TLS clients.
+CoW API order lookups are split into the documented maximum of 128 UIDs; leased `order_uid` work items share one batched fetch. Account orders and v2 trades paginate with 1,000-row pages until a short page is received. `curl_cffi` browser TLS impersonation is used because CoW's edge distinguishes (and blocks) ordinary Python TLS clients — this is required even with an API key, which is sent as `X-API-Key`. A single rate limiter is shared across all chains (they hit the same host and key); it uses bounded exponential backoff on retryable statuses and additionally backs the global rate off toward `COW_API_MAX_INTERVAL_SECONDS` on `429`/`403`, recovering as requests succeed.
 
-The ClickHouse work queue is append-only and restart-safe. Terminal revisions prevent a replayed chain range from reviving completed work. Run only one enrichment worker replica for a given `(environment, chain_id)`; ClickHouse does not provide a transactional competing-consumer lease.
+The ClickHouse work queue is append-only and restart-safe. Terminal revisions prevent a replayed chain range from reviving completed work. A competition the public API no longer serves is marked terminal `unavailable_from_public_api` (recorded, not retried, not dead-lettered). Run only one enrichment worker replica for a given `(environment, chain_id)`; ClickHouse does not provide a transactional competing-consumer lease.
+
+## Observability
+
+The continuous service serves three endpoints on `COW_METRICS_PORT` (default 9090):
+
+- `/health`: process liveness
+- `/ready`: ClickHouse connectivity
+- `/metrics`: Prometheus metrics
+
+Exported metrics (labeled by chain):
+
+- `cow_chain_lag_blocks{chain}` — safe head minus the committed scan position
+- `cow_rows_written_total{chain,table}` — rows written per table
+- `cow_work_queue_items{chain}` — pending enrichment work
+- `cow_rpc_requests_total{chain,method,status}` and `cow_api_requests_total{chain,route,status}` — request counts (the API metric is labeled by templated route, not the per-UID path, to bound series cardinality)
+- `cow_request_seconds{source,chain}` — RPC/API latency histogram
+
+Logs are structured JSON on stdout. During a backfill, watch `cow_rows_written_total` increasing and the `range_indexed` log line advancing; `cow_chain_lag_blocks` and `cow_work_queue_items` are legitimately large until a chain catches up, so alert on "no rows written" and pod health rather than on lag/backlog thresholds during the initial backfill.
+
+## Recovering from failures
+
+Checkpoints are durable in ClickHouse per `(environment, chain_id, source='rpc')`, and all writes are idempotent (ReplacingMergeTree), so recovery from almost any interruption is to restart `continuous` — each chain resumes from its last committed checkpoint with no data loss.
+
+- **Process crash / restart / redeploy.** Restart `continuous`; it resumes per chain from the checkpoint. No manual step.
+- **A chain stops advancing (silent stall).** RPC calls are timeout-guarded, so a hung provider raises and the per-chain loop retries instead of parking. Confirm progress via `status` (checkpoint advancing) and the `cow_rows_written_total` / `range_indexed` signals. If one provider is unhealthy, swap its `COW_RPC_URL_*` and restart.
+- **RPC range/response limit** (`-32005`, "too many logs", "block range" …). Handled automatically — the scan halves the window down to 50 blocks and continues, logging `rpc_range_reduced` (not an error). No action needed.
+- **Pruned / non-archive RPC** (`-32701 History has been pruned`, "Archive requests require a token"). The node cannot serve historical logs at the deployment block. Detect with `preflight`; point `COW_RPC_URL_*` at a history-serving node (archive *state* is not required, but historical `eth_getLogs` back to the deployment block is) and restart.
+- **CoW API `403 Request blocked` / `429`.** The edge is rate-limiting. Set `COW_API_KEY`; the client self-throttles (global adaptive backoff) and retries. If it persists, raise `COW_API_INTERVAL_SECONDS` (e.g. `0.2`) or lower `COW_ENRICH_CONCURRENCY`. Transient blocks clear on their own and work items are retried, not lost.
+- **Dead letters.** Items that exhaust `COW_MAX_ATTEMPTS` land in `dead_letters`; inspect them for the cause. To retry, re-enqueue the originating range with `repair` (idempotent). Historical competitions the API no longer serves are terminal `unavailable_from_public_api`, not failures.
+- **Reorg.** Handled automatically — canonical block hashes are re-observed within the finality window and the `*_canonical` views drop orphaned-hash rows. Force re-observation of an older range with `repair` (it re-fetches every block header in the range).
+- **A gap or a newly added contract.** `repair --chain X --from-block A --to-block B` rescans a bounded range without moving the forward checkpoint backward. Example: after adding a contract with an earlier `from_block`, repair `[new_from_block, current_checkpoint]` — a lowered start block only auto-applies to a chain that has no checkpoint yet.
+- **Start over / wipe.** `TRUNCATE` the data tables (keep `schema_migrations`), then run `continuous`; with no checkpoint each chain restarts at its pinned deployment block. `TRUNCATE` needs only table privileges, not `DROP DATABASE`.
+- **Bringing up many chains.** Run `preflight --chain all` first; pin each chain's `from_block` in `deployments/*.json` (a `0` start scans from genesis); ensure every `COW_RPC_URL_*` is set. The CoW API budget is global, so more chains means slower per-chain enrichment.
 
 ## Authoritative off-chain export
 
@@ -192,8 +259,9 @@ Integration tests require ClickHouse and are marked `integration`. Live tests re
 ## Operational notes
 
 - Run migrations before any ingestion command.
+- Run `preflight` before enabling new chains, and pin each chain's `from_block` so it does not scan from genesis.
+- Set `COW_API_KEY`; keep RPC URLs, the API key, and PostgreSQL DSNs out of logs and committed configuration.
 - Use a dedicated ClickHouse database and credentials in production.
-- Keep RPC URLs and PostgreSQL DSNs out of logs and committed configuration.
 - Back up ClickHouse before schema upgrades.
-- Alert on safe-head lag, request failures, dead letters, and import conflicts.
+- Alert on pod health and on "no rows written in an hour" (a stall), plus RPC/API error ratios, dead letters, and import conflicts. Treat `cow_chain_lag_blocks` and `cow_work_queue_items` thresholds as steady-state signals to enable only after the initial backfill catches up — they are legitimately large during it.
 - “Complete off-chain history” may only be claimed when a validated export manifest declares the required historical boundary.
