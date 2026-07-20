@@ -103,6 +103,10 @@ class ClickHouseConfig(BaseModel):
     password: str = ""
     database: str = "cow_indexer"
     secure: bool = False
+    # HTTP connection-pool size. The default clickhouse-connect pool is 8, which one
+    # shared async client saturates when many chains scan concurrently ("Connection
+    # pool is full, discarding connection"). Scale it up for multi-chain runs.
+    pool_size: int = 32
 
     @classmethod
     def from_env(cls) -> ClickHouseConfig:
@@ -113,6 +117,7 @@ class ClickHouseConfig(BaseModel):
             password=os.getenv("CLICKHOUSE_PASSWORD", ""),
             database=os.getenv("CLICKHOUSE_DATABASE", "cow_indexer"),
             secure=os.getenv("CLICKHOUSE_SECURE", "false").lower() in {"1", "true", "yes"},
+            pool_size=int(os.getenv("CLICKHOUSE_POOL_SIZE", "32")),
         )
 
 

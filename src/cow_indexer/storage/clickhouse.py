@@ -8,6 +8,7 @@ from typing import Any
 
 import clickhouse_connect
 import structlog
+from clickhouse_connect.driver import httputil
 
 from cow_indexer.config import ChainConfig, ClickHouseConfig
 from cow_indexer.models import BlockHeader, DecodedEvent, ImportStats, RpcLog, WorkItem
@@ -76,6 +77,9 @@ class ClickHouseStore:
 
     async def connect(self) -> ClickHouseStore:
         if self.client is None:
+            # Enlarge the HTTP connection pool: one shared async client serves all
+            # chains, and the default pool of 8 is saturated by concurrent scanners.
+            pool_mgr = httputil.get_pool_manager(maxsize=self.config.pool_size, num_pools=4)
             self.client = await clickhouse_connect.get_async_client(
                 host=self.config.host,
                 port=self.config.port,
@@ -83,6 +87,7 @@ class ClickHouseStore:
                 password=self.config.password,
                 database="default",
                 secure=self.config.secure,
+                pool_mgr=pool_mgr,
             )
         return self
 
