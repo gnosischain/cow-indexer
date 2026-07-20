@@ -28,9 +28,15 @@ class HttpTransport(Protocol):
 
 
 class CurlTransport:
-    """curl_cffi transport using browser TLS impersonation for CoW's edge."""
+    """curl_cffi transport using browser TLS impersonation for CoW's edge.
 
-    def __init__(self, timeout: float = 30.0) -> None:
+    ``headers`` are sent on every request (e.g. an ``X-API-Key``). The browser
+    TLS/JA3 impersonation is still required with an API key: CoW's CloudFront edge
+    rate-limits by handshake fingerprint and blocks plain Python TLS regardless.
+    """
+
+    def __init__(self, timeout: float = 30.0, headers: dict[str, str] | None = None) -> None:
+        self.headers = headers or {}
         self._session = AsyncSession(impersonate="chrome", timeout=timeout)
 
     async def request(
@@ -41,7 +47,9 @@ class CurlTransport:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> HttpResponse:
-        response = await self._session.request(method, url, params=params, json=json)
+        response = await self._session.request(
+            method, url, params=params, json=json, headers=self.headers or None
+        )
         text = response.text
         try:
             data = response.json()

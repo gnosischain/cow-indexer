@@ -120,15 +120,27 @@ class RuntimeConfig(BaseModel):
     worker_id: str = Field(default_factory=lambda: f"{socket.gethostname()}-{os.getpid()}")
     metrics_host: str = "0.0.0.0"
     metrics_port: int = 9090
-    api_interval_seconds: float = 0.05
+    api_interval_seconds: float = 0.1
+    api_max_interval_seconds: float = 5.0
+    enrich_concurrency: int = 6
     max_attempts: int = 6
+    api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
+        api_key = os.getenv("COW_API_KEY") or None
+        # With an X-API-Key the CoW allowance is ~30 RPS; run ~10 RPS to stay under it.
+        # Without a key the public edge blocks well below that, so default much slower.
+        default_interval = "0.1" if api_key else "0.6"
         return cls(
             worker_id=os.getenv("COW_WORKER_ID") or f"{socket.gethostname()}-{os.getpid()}",
             metrics_host=os.getenv("COW_METRICS_HOST", "0.0.0.0"),
             metrics_port=int(os.getenv("COW_METRICS_PORT", "9090")),
+            api_interval_seconds=float(os.getenv("COW_API_INTERVAL_SECONDS", default_interval)),
+            api_max_interval_seconds=float(os.getenv("COW_API_MAX_INTERVAL_SECONDS", "5.0")),
+            enrich_concurrency=int(os.getenv("COW_ENRICH_CONCURRENCY", "6")),
+            max_attempts=int(os.getenv("COW_MAX_ATTEMPTS", "6")),
+            api_key=api_key,
         )
 
 

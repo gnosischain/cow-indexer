@@ -30,7 +30,13 @@ class CompetitionUnavailable(RuntimeError):
 
 
 class AsyncRateLimiter:
-    def __init__(self, interval_seconds: float) -> None:
+    """One request per ``interval_seconds``, adaptively backing off toward
+    ``max_interval_seconds`` when the upstream edge throttles us (429/403) and
+    recovering toward the base rate as requests succeed."""
+
+    def __init__(self, interval_seconds: float, max_interval_seconds: float = 5.0) -> None:
+        self.base_interval = interval_seconds
+        self.max_interval = max(max_interval_seconds, interval_seconds)
         self.interval_seconds = interval_seconds
         self._lock = asyncio.Lock()
         self._next = 0.0
@@ -43,6 +49,14 @@ class AsyncRateLimiter:
                 await asyncio.sleep(delay)
             self._next = loop.time() + self.interval_seconds
 
+    def slow_down(self, factor: float = 2.0) -> None:
+        self.interval_seconds = min(
+            self.max_interval, max(self.base_interval, self.interval_seconds * factor)
+        )
+
+    def speed_up(self, factor: float = 0.9) -> None:
+        self.interval_seconds = max(self.base_interval, self.interval_seconds * factor)
+
 
 class CowApiClient:
     def __init__(
@@ -52,11 +66,17 @@ class CowApiClient:
         transport: HttpTransport | None = None,
         interval_seconds: float = 0.05,
         max_attempts: int = 6,
+        max_interval_seconds: float = 5.0,
+        api_key: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.chain_key = chain_key
-        self.transport = transport or CurlTransport()
-        self.limiter = AsyncRateLimiter(interval_seconds)
+        self.api_key = api_key
+        if transport is None:
+            headers = {"X-API-Key": api_key} if api_key else None
+            transport = CurlTransport(headers=headers)
+        self.transport = transport
+        self.limiter = AsyncRateLimiter(interval_seconds, max_interval_seconds)
         self.max_attempts = max_attempts
 
     async def close(self) -> None:
@@ -73,6 +93,10 @@ class CowApiClient:
         route: str | None = None,
     ) -> Any:
         response: HttpResponse | None = None
+        # 403 is included because CoW's CloudFront edge returns "Request blocked" with a
+        # 403 when it rate-limits a client; 403/429 additionally slow the global rate.
+        retryable = {403, 408, 425, 429, 500, 502, 503, 504}
+        throttling = {403, 429}
         for attempt in range(self.max_attempts):
             await self.limiter.wait()
             with REQUEST_LATENCY.labels("api", self.chain_key).time():
@@ -83,11 +107,14 @@ class CowApiClient:
             # per-tx URLs do not explode Prometheus series cardinality.
             API_REQUESTS.labels(self.chain_key, route or path, str(response.status)).inc()
             if 200 <= response.status < 300:
+                self.limiter.speed_up()
                 return response.data if response.data is not None else response.text
             if allow_404 and response.status == 404:
                 return None
-            if response.status not in {408, 425, 429, 500, 502, 503, 504}:
+            if response.status not in retryable:
                 break
+            if response.status in throttling:
+                self.limiter.slow_down()
             retry_after = response.headers.get("retry-after")
             delay = float(retry_after) if retry_after and retry_after.isdigit() else 2**attempt
             await asyncio.sleep(min(30.0, delay + random.random() * 0.2))

@@ -47,10 +47,14 @@ async def run_continuous(
                     chain.key,
                     interval_seconds=runtime.api_interval_seconds,
                     max_attempts=runtime.max_attempts,
+                    max_interval_seconds=runtime.api_max_interval_seconds,
+                    api_key=runtime.api_key,
                 )
                 clients.append((rpc, api))
                 historical = HistoricalIndexer(chain, rpc, store)
-                enrichment = EnrichmentService(chain, api, store, runtime)
+                enrichment = EnrichmentService(
+                    chain, api, store, runtime, concurrency=runtime.enrich_concurrency
+                )
 
                 async def scan_action(indexer=historical) -> None:
                     await indexer.scan()

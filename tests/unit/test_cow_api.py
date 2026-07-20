@@ -1,8 +1,9 @@
+import asyncio
 from typing import Any
 
 import pytest
 
-from cow_indexer.sources.cow_api import CowApiClient
+from cow_indexer.sources.cow_api import AsyncRateLimiter, CowApiClient
 from cow_indexer.sources.http import HttpResponse
 
 
@@ -56,3 +57,62 @@ async def test_trades_requires_exactly_one_selector() -> None:
     )
     with pytest.raises(ValueError):
         await anext(client.iter_trades())
+
+
+@pytest.mark.asyncio
+async def test_api_key_sets_auth_header() -> None:
+    client = CowApiClient("https://api.example", "test", interval_seconds=0, api_key="secret-key")
+    try:
+        assert client.transport.headers.get("X-API-Key") == "secret-key"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_no_api_key_sends_no_auth_header() -> None:
+    client = CowApiClient("https://api.example", "test", interval_seconds=0)
+    try:
+        assert "X-API-Key" not in client.transport.headers
+    finally:
+        await client.close()
+
+
+def test_rate_limiter_backs_off_and_recovers() -> None:
+    limiter = AsyncRateLimiter(0.1, max_interval_seconds=1.0)
+    for _ in range(10):
+        limiter.slow_down()
+    assert limiter.interval_seconds == 1.0  # capped at max_interval
+    for _ in range(100):
+        limiter.speed_up()
+    assert limiter.interval_seconds == 0.1  # floored at base_interval
+
+
+class _BlockThenOk:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def request(self, method, url, *, params=None, json=None):
+        self.calls += 1
+        if self.calls == 1:
+            return HttpResponse(403, None, text="Request blocked")
+        return HttpResponse(200, {"ok": True})
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_403_is_retried_and_throttles(monkeypatch) -> None:
+    async def fast_sleep(_delay):
+        return
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+    transport = _BlockThenOk()
+    client = CowApiClient(
+        "https://api.example", "test", transport=transport, interval_seconds=0.001
+    )
+    base = client.limiter.base_interval
+    result = await client._request("GET", "/api/v1/version", route="/api/v1/version")
+    assert result == {"ok": True}
+    assert transport.calls == 2  # 403 was retried, not raised
+    assert client.limiter.interval_seconds > base  # and it slowed the global rate
