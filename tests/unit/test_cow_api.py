@@ -77,6 +77,14 @@ async def test_no_api_key_sends_no_auth_header() -> None:
         await client.close()
 
 
+@pytest.mark.asyncio
+async def test_clients_can_share_one_limiter() -> None:
+    limiter = AsyncRateLimiter(0.1)
+    a = CowApiClient("https://api.example/mainnet", "mainnet", transport=FakeTransport(), limiter=limiter)
+    b = CowApiClient("https://api.example/xdai", "gnosis", transport=FakeTransport(), limiter=limiter)
+    assert a.limiter is limiter and b.limiter is limiter  # one global rate budget
+
+
 def test_rate_limiter_backs_off_and_recovers() -> None:
     limiter = AsyncRateLimiter(0.1, max_interval_seconds=1.0)
     for _ in range(10):

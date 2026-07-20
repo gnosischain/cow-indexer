@@ -13,6 +13,7 @@ from cow_indexer.observability import configure_logging
 from cow_indexer.services.continuous import run_continuous
 from cow_indexer.services.export_import import ExportImportService, inspect_bundle
 from cow_indexer.services.historical import HistoricalIndexer
+from cow_indexer.services.preflight import run_preflight
 from cow_indexer.services.repair import repair_range
 from cow_indexer.services.validation import ValidationService
 from cow_indexer.sources.exports.manifest import load_manifest
@@ -286,6 +287,26 @@ def coverage(
             await store.close()
 
     asyncio.run(run())
+
+
+@app.command()
+def preflight(
+    chain: Annotated[str, typer.Option("--chain")] = "all",
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Check each chain's RPC (head + historical getLogs) and CoW API without touching
+    ClickHouse. Exits non-zero if any selected chain's RPC path fails."""
+
+    async def run() -> bool:
+        indexer_config = load_config(config)
+        results = await run_preflight(
+            indexer_config.select(chain), RuntimeConfig.from_env().api_key
+        )
+        _print(results)
+        return all(result["ok"] for result in results)
+
+    if not asyncio.run(run()):
+        raise typer.Exit(1)
 
 
 @app.command()

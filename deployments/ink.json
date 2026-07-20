@@ -1,2 +1,1 @@
-{"network":"ink","chain_id":57073,"source":"official CoW deployment registries","contracts":[{"name":"GPv2Settlement","address":"0x9008d19f58aabd9ed0d60971565aa8510560ab41","from_block":0,"abi":"abis/GPv2Settlement.json"}]}
-
+{"network":"ink","chain_id":57073,"source":"official CoW deployment registries","contracts":[{"name":"GPv2Settlement","address":"0x9008d19f58aabd9ed0d60971565aa8510560ab41","from_block":34436849,"abi":"abis/GPv2Settlement.json"}]}

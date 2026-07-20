@@ -8,7 +8,7 @@ from cow_indexer.config import ChainConfig, RuntimeConfig
 from cow_indexer.observability import WORK_QUEUE, HealthServer
 from cow_indexer.services.enrichment import EnrichmentService
 from cow_indexer.services.historical import HistoricalIndexer
-from cow_indexer.sources.cow_api import CowApiClient
+from cow_indexer.sources.cow_api import AsyncRateLimiter, CowApiClient
 from cow_indexer.sources.rpc import RpcClient
 from cow_indexer.storage.clickhouse import ClickHouseStore
 from cow_indexer.utils import normalize_auction_order
@@ -38,6 +38,10 @@ async def run_continuous(
     server = HealthServer(runtime.metrics_host, runtime.metrics_port, store.ping)
     await server.start()
     clients: list[tuple[RpcClient, CowApiClient]] = []
+    # One limiter shared by every chain: all CoW API calls target the same
+    # api.cow.fi host/key, so the rate budget must be global. Otherwise N chains
+    # run at N x the per-chain rate and blow past the key's allowance.
+    api_limiter = AsyncRateLimiter(runtime.api_interval_seconds, runtime.api_max_interval_seconds)
     try:
         async with asyncio.TaskGroup() as group:
             for chain in chains:
@@ -45,10 +49,9 @@ async def run_continuous(
                 api = CowApiClient(
                     chain.api_base_url,
                     chain.key,
-                    interval_seconds=runtime.api_interval_seconds,
                     max_attempts=runtime.max_attempts,
-                    max_interval_seconds=runtime.api_max_interval_seconds,
                     api_key=runtime.api_key,
+                    limiter=api_limiter,
                 )
                 clients.append((rpc, api))
                 historical = HistoricalIndexer(chain, rpc, store)

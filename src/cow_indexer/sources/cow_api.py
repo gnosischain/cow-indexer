@@ -68,6 +68,7 @@ class CowApiClient:
         max_attempts: int = 6,
         max_interval_seconds: float = 5.0,
         api_key: str | None = None,
+        limiter: AsyncRateLimiter | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.chain_key = chain_key
@@ -76,7 +77,9 @@ class CowApiClient:
             headers = {"X-API-Key": api_key} if api_key else None
             transport = CurlTransport(headers=headers)
         self.transport = transport
-        self.limiter = AsyncRateLimiter(interval_seconds, max_interval_seconds)
+        # A shared limiter lets multiple chains share one api.cow.fi rate budget
+        # (they hit the same host/key); otherwise each chain limits independently.
+        self.limiter = limiter or AsyncRateLimiter(interval_seconds, max_interval_seconds)
         self.max_attempts = max_attempts
 
     async def close(self) -> None:
