@@ -1,5 +1,7 @@
 # CoW Protocol Indexer
 
+![Cow](img/header-banner.png)
+
 A standalone, multi-chain indexer for CoW Protocol. It reads canonical contract events directly from EVM JSON-RPC, enriches discovered orders and settlements through the public CoW API, and optionally imports authoritative off-chain history bundles. It does not depend on DBT or any existing ingestion pipeline.
 
 ## Coverage model
