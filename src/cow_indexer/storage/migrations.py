@@ -17,14 +17,25 @@ def split_sql(source: str) -> list[str]:
     buffer: list[str] = []
     quote: str | None = None
     escaped = False
-    for character in source:
+    index = 0
+    length = len(source)
+    while index < length:
+        character = source[index]
         if escaped:
             buffer.append(character)
             escaped = False
+            index += 1
             continue
         if character == "\\" and quote:
             buffer.append(character)
             escaped = True
+            index += 1
+            continue
+        # Skip `-- ...` line comments when outside a string so their contents
+        # (semicolons, apostrophes) cannot be mistaken for SQL tokens.
+        if quote is None and character == "-" and index + 1 < length and source[index + 1] == "-":
+            while index < length and source[index] != "\n":
+                index += 1
             continue
         if character in {"'", '"', "`"}:
             if quote == character:
@@ -38,6 +49,7 @@ def split_sql(source: str) -> list[str]:
             buffer = []
         else:
             buffer.append(character)
+        index += 1
     trailing = "".join(buffer).strip()
     if trailing:
         statements.append(trailing)

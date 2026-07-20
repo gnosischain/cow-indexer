@@ -80,7 +80,7 @@ class WorkItem(BaseModel):
     work_id: str
     environment: str
     chain_id: int
-    kind: Literal["order_uid", "owner", "tx_hash", "app_data", "token"]
+    kind: Literal["order_uid", "owner", "tx_hash", "tx_competition", "app_data", "token"]
     key: str
     payload: dict[str, Any] = Field(default_factory=dict)
     attempts: int = 0

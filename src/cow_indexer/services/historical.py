@@ -7,6 +7,7 @@ import structlog
 from cow_indexer.config import ChainConfig
 from cow_indexer.decoders import MultiContractDecoder
 from cow_indexer.loaders.events import EventProcessor
+from cow_indexer.models import DecodedEvent
 from cow_indexer.observability import CHAIN_LAG
 from cow_indexer.sources.rpc import RpcClient, RpcRangeTooLarge
 from cow_indexer.storage.base import Storage
@@ -84,12 +85,14 @@ class HistoricalIndexer:
             blocks = await self.rpc.get_blocks(block_numbers)
             await self.store.store_blocks(self.chain, blocks.values())
             await self.store.store_raw_logs(self.chain, logs)
+            decoded: list[DecodedEvent] = []
             for rpc_log in logs:
                 event = self.decoder.decode(rpc_log)
                 if event is None:
                     continue
                 event.block_timestamp = blocks[rpc_log.block_number].timestamp
-                await self.processor.process(event)
+                decoded.append(event)
+            await self.processor.process_many(decoded)
             if update_checkpoint:
                 await self.store.checkpoint(self.chain, blocks[upper])
             if hasattr(self.store, "record_range"):
@@ -99,6 +102,9 @@ class HistoricalIndexer:
             total_logs += len(logs)
             cursor = upper + 1
             range_size = min(self.maximum_range, range_size * 2)
+            # Refresh lag after every committed range so a long catch-up scan does not
+            # leave a stale gauge until the whole scan returns.
+            CHAIN_LAG.labels(self.chain.key).set(max(0, safe_head.number - upper))
             log.info(
                 "range_indexed",
                 chain=self.chain.key,
