@@ -4,11 +4,7 @@ from pathlib import Path
 import pytest
 
 from cow_indexer.config import ClickHouseConfig, load_config
-from cow_indexer.storage.clickhouse import (
-    FINAL_QUERY_MEMORY,
-    PURGE_SETTINGS,
-    ClickHouseStore,
-)
+from cow_indexer.storage.clickhouse import ClickHouseStore
 
 ROOT = Path(__file__).parents[2]
 
@@ -62,14 +58,15 @@ async def test_purge_selects_bounded_then_deletes_all_versions() -> None:
     select_sql, _, select_settings = fake.queries[0]
     assert "FINAL" not in select_sql
     assert "LIMIT" in select_sql
-    assert select_settings["max_memory_usage"] == FINAL_QUERY_MEMORY
+    assert select_settings == store._final_settings
     # The DELETE removes every version of the selected work_ids and carries the
     # bounded-set + synchronous-lightweight-delete settings.
     assert len(fake.commands) == 1
     delete_sql, _, delete_settings = fake.commands[0]
     assert delete_sql.startswith("DELETE FROM")
     assert "('id1','id2')" in delete_sql
-    assert delete_settings == PURGE_SETTINGS
+    assert delete_settings == store._purge_settings
+    assert delete_settings["lightweight_deletes_sync"] == 2
 
 
 @pytest.mark.asyncio
@@ -92,7 +89,8 @@ async def test_lease_work_is_memory_capped_and_gated() -> None:
 
     assert leased == []
     _, _, settings = fake.queries[0]
-    assert settings["max_memory_usage"] == FINAL_QUERY_MEMORY
+    assert settings == store._final_settings
+    assert settings["max_threads"] == store.config.final_query_threads
     # The process-wide FINAL gate was created and bounds concurrency.
     assert store._final_semaphore is not None
 
@@ -107,4 +105,15 @@ async def test_known_tokens_and_active_orders_are_memory_capped() -> None:
     await store.active_order_uids(chain)
 
     for _, _, settings in fake.queries:
-        assert settings["max_memory_usage"] == FINAL_QUERY_MEMORY
+        assert settings == store._final_settings
+
+
+def test_final_settings_defaults() -> None:
+    store = ClickHouseStore(ClickHouseConfig(), ROOT)
+    # 1 GiB per-query ceiling (headroom to read a large queue), low threads to keep the
+    # FINAL peak bounded; the purge DELETE layers the bounded-set + sync-delete settings.
+    assert store._final_settings == {"max_memory_usage": 1024 * 1024 * 1024, "max_threads": 2}
+    assert store._purge_settings["max_memory_usage"] == 1024 * 1024 * 1024
+    assert store._purge_settings["max_threads"] == 2
+    assert store._purge_settings["lightweight_deletes_sync"] == 2
+    assert store._purge_settings["max_rows_in_set"] == 50_000

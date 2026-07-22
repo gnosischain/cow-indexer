@@ -107,6 +107,14 @@ class ClickHouseConfig(BaseModel):
     # shared async client saturates when many chains scan concurrently ("Connection
     # pool is full, discarding connection"). Scale it up for multi-chain runs.
     pool_size: int = 32
+    # Per-query ceiling (MiB) for continuous-path FINAL reads (e.g. lease_work). Big
+    # enough to read a large ReplacingMergeTree queue, small enough that one oversized
+    # query fails in isolation instead of tripping the OvercommitTracker; paired with a
+    # process-wide semaphore capping concurrent FINAL reads so the aggregate is bounded.
+    final_query_memory_mb: int = 1024
+    # Threads for those FINAL reads. Low, because FINAL peak memory scales with the
+    # number of parts read in parallel, so fewer threads = lower peak.
+    final_query_threads: int = 2
 
     @classmethod
     def from_env(cls) -> ClickHouseConfig:
@@ -118,6 +126,8 @@ class ClickHouseConfig(BaseModel):
             database=os.getenv("CLICKHOUSE_DATABASE", "cow_indexer"),
             secure=os.getenv("CLICKHOUSE_SECURE", "false").lower() in {"1", "true", "yes"},
             pool_size=int(os.getenv("CLICKHOUSE_POOL_SIZE", "32")),
+            final_query_memory_mb=int(os.getenv("CLICKHOUSE_FINAL_MEMORY_MB", "1024")),
+            final_query_threads=int(os.getenv("CLICKHOUSE_FINAL_MAX_THREADS", "2")),
         )
 
 
@@ -130,6 +140,11 @@ class RuntimeConfig(BaseModel):
     enrich_concurrency: int = 6
     max_attempts: int = 6
     api_key: str | None = None
+    # Lease a larger batch of work items less often (vs many tiny leases per second):
+    # each lease is a FINAL over the work_items queue, so fewer/larger leases cut the
+    # DB load. Throughput is ultimately bounded by the global API rate limiter anyway.
+    enrich_batch: int = 200
+    enrich_interval_seconds: float = 10.0
     # Scheduled retention of terminal work_items so the queue stays small and the
     # lease_work FINAL never scans an unbounded table. Disable during a one-time
     # backlog cleanup (run the `purge-work` CLI instead) so the two don't overlap.
@@ -153,6 +168,8 @@ class RuntimeConfig(BaseModel):
             enrich_concurrency=int(os.getenv("COW_ENRICH_CONCURRENCY", "6")),
             max_attempts=int(os.getenv("COW_MAX_ATTEMPTS", "6")),
             api_key=api_key,
+            enrich_batch=int(os.getenv("COW_ENRICH_BATCH", "200")),
+            enrich_interval_seconds=float(os.getenv("COW_ENRICH_INTERVAL_SECONDS", "10")),
             purge_enabled=os.getenv("COW_PURGE_ENABLED", "true").lower() in {"1", "true", "yes"},
             purge_interval_seconds=float(os.getenv("COW_PURGE_INTERVAL_SECONDS", "900")),
             purge_grace_hours=float(os.getenv("COW_PURGE_GRACE_HOURS", "24")),

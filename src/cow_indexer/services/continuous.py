@@ -130,7 +130,7 @@ async def run_continuous(
                                 )
 
                 async def enrich_action(service=enrichment) -> None:
-                    await service.run_once()
+                    await service.run_once(limit=runtime.enrich_batch)
 
                 async def token_metadata_action(current_chain=chain, current_rpc=rpc) -> None:
                     have = set(await store.tokens_with_metadata(current_chain))
@@ -164,7 +164,11 @@ async def run_continuous(
 
                 group.create_task(_resilient_loop("rpc", chain, scan_action, 12.0))
                 group.create_task(_resilient_loop("competition", chain, competition_action, 30.0))
-                group.create_task(_resilient_loop("enrichment", chain, enrich_action, 1.0))
+                group.create_task(
+                    _resilient_loop(
+                        "enrichment", chain, enrich_action, runtime.enrich_interval_seconds
+                    )
+                )
                 group.create_task(_resilient_loop("active-orders", chain, active_action, 60.0))
                 group.create_task(_resilient_loop("token-prices", chain, token_price_action, 300.0))
                 group.create_task(

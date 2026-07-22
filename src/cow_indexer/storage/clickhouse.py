@@ -39,22 +39,20 @@ UNAVAILABLE_REVISION = MAX_REVISION - 2
 # every version of such work_ids (see purge_finished_work).
 TERMINAL_WORK_STATUSES = ("done", "dead", "unavailable_from_public_api")
 
-# Per-query memory ceiling for continuous-path FINAL reads. Well under the instance
-# limit so a single oversized FINAL fails in isolation (and the loop backs off)
-# instead of tripping the OvercommitTracker and cascading to ingestion. max_memory_usage
-# is per-query/per-server, not an aggregate limit, so it is paired with a process-wide
-# semaphore (ClickHouseStore._final_gate) capping concurrent FINAL reads.
-FINAL_QUERY_MEMORY = 128 * 1024 * 1024  # 128 MiB
+# Concurrent continuous-path FINAL reads allowed process-wide. max_memory_usage (see
+# ClickHouseConfig.final_query_memory_mb) is per-query, not an aggregate limit, so this
+# semaphore bounds the total: at most MAX_CONCURRENT_FINAL x the per-query cap. A single
+# oversized FINAL then fails in isolation (and the loop backs off) instead of tripping
+# the OvercommitTracker and cascading to ingestion.
 MAX_CONCURRENT_FINAL = 2
 
-# Settings for the retention DELETE: bound the IN-set memory and force a synchronous
-# lightweight delete so a batch is fully applied (and its rows masked from the next
-# SELECT) before the next batch is chosen — which is what makes the drain terminate.
-PURGE_SETTINGS = {
-    "max_memory_usage": FINAL_QUERY_MEMORY,
+# Extra settings for the retention DELETE, layered on the per-store FINAL settings:
+# bound the IN-set memory and force a synchronous lightweight delete so a batch is fully
+# applied (and its rows masked from the next SELECT) before the next batch is chosen —
+# which is what makes the drain terminate.
+PURGE_DELETE_SETTINGS = {
     "max_rows_in_set": 50_000,
     "max_bytes_in_set": 64 * 1024 * 1024,
-    "max_threads": 2,
     "lightweight_delete_mode": "lightweight_update_force",
     "lightweight_deletes_sync": 2,
 }
@@ -104,6 +102,14 @@ class ClickHouseStore:
         # Process-wide gate limiting how many continuous-path FINAL reads run at once.
         # Created lazily inside the running loop so it binds to the correct event loop.
         self._final_semaphore: asyncio.Semaphore | None = None
+        # Per-query settings for continuous-path FINAL reads and the retention DELETE,
+        # sized from config (memory big enough to read a large queue, threads low so the
+        # FINAL peak — which scales with parts read in parallel — stays bounded).
+        self._final_settings = {
+            "max_memory_usage": config.final_query_memory_mb * 1024 * 1024,
+            "max_threads": config.final_query_threads,
+        }
+        self._purge_settings = {**self._final_settings, **PURGE_DELETE_SETTINGS}
 
     async def connect(self) -> ClickHouseStore:
         if self.client is None:
@@ -786,7 +792,7 @@ class ClickHouseStore:
                     "chain_id": chain.chain_id,
                     "limit": limit,
                 },
-                settings={"max_memory_usage": FINAL_QUERY_MEMORY},
+                settings=self._final_settings,
             )
         now = utcnow()
         items: list[WorkItem] = []
@@ -894,7 +900,7 @@ class ClickHouseStore:
                     "chain_id": chain.chain_id,
                     "limit": limit,
                 },
-                settings={"max_memory_usage": FINAL_QUERY_MEMORY},
+                settings=self._final_settings,
             )
         return [row[0] for row in result.result_rows]
 
@@ -920,7 +926,7 @@ class ClickHouseStore:
                     "chain_id": chain.chain_id,
                     "limit": limit,
                 },
-                settings={"max_memory_usage": FINAL_QUERY_MEMORY},
+                settings=self._final_settings,
             )
         return [row[0] for row in result.result_rows]
 
@@ -983,7 +989,7 @@ class ClickHouseStore:
                     "cutoff": cutoff,
                     "batch": batch,
                 },
-                settings={"max_memory_usage": FINAL_QUERY_MEMORY, "max_threads": 2},
+                settings=self._final_settings,
             )
         work_ids = [row[0] for row in selected.result_rows]
         if not work_ids:
@@ -996,7 +1002,7 @@ class ClickHouseStore:
             "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
             f"AND work_id IN ('{id_list}')",
             parameters={"environment": chain.environment, "chain_id": chain.chain_id},
-            settings=PURGE_SETTINGS,
+            settings=self._purge_settings,
         )
         return len(work_ids)
 
