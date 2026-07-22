@@ -10,6 +10,12 @@ def test_detects_common_log_range_errors() -> None:
     assert is_range_error(-1, "please limit the block range")
     assert is_range_error(-1, "Too many logs requested. Max logs per response is 20000.")
     assert not is_range_error(-32601, "method not found")
+    # The real reason can live in `data`: a -32602 "invalid params" whose data field
+    # says the result cap was exceeded is a range error, not a malformed request.
+    assert is_range_error(
+        -32602, "invalid params", "Query returned more than 50000 results. Try [0x1, 0x2]"
+    )
+    assert not is_range_error(-32602, "invalid params")
 
 
 class _StubTransport:
@@ -70,6 +76,32 @@ async def test_getlogs_falls_back_to_per_address_on_32602() -> None:
     assert logs == []
     # first the rejected array, then one query per address
     assert transport.addresses == [[a, b], a, b]
+
+
+@pytest.mark.asyncio
+async def test_getlogs_result_limit_reported_in_data_is_range_error() -> None:
+    # Provider caps results and reports it as -32602 "invalid params" with the reason in
+    # `data`; the scanner relies on this being RpcRangeTooLarge to halve the range
+    # instead of spinning on the same oversized call.
+    body = {
+        "jsonrpc": "2.0",
+        "error": {
+            "code": -32602,
+            "message": "invalid params",
+            "data": "Query returned more than 50000 results. Try with this block range [0x1, 0x2]",
+        },
+    }
+    with pytest.raises(RpcRangeTooLarge):
+        await _client(HttpResponse(200, body)).get_logs(0, 50000, ["0x" + "11" * 20])
+
+
+@pytest.mark.asyncio
+async def test_getlogs_plain_invalid_params_stays_rpc_error() -> None:
+    # A -32602 with no range/result marker is a genuine bad request, not a range hint.
+    body = {"jsonrpc": "2.0", "error": {"code": -32602, "message": "invalid params"}}
+    with pytest.raises(RpcError) as exc:
+        await _client(HttpResponse(200, body)).get_logs(0, 100, ["0x" + "11" * 20])
+    assert not isinstance(exc.value, RpcRangeTooLarge)
 
 
 @pytest.mark.asyncio

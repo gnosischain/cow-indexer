@@ -59,8 +59,12 @@ class RpcRangeTooLarge(RpcError):
     pass
 
 
-def is_range_error(code: int, message: str) -> bool:
-    lowered = message.lower()
+def is_range_error(code: int, message: str, data: Any = None) -> bool:
+    # Some providers report a getLogs result/range cap as a generic message with the
+    # real reason in `data` — e.g. code -32602 "invalid params", data "Query returned
+    # more than 50000 results. Try with this block range [...]". Scan both so the marker
+    # is found wherever the provider puts it.
+    lowered = f"{message} {data}".lower() if data is not None else message.lower()
     markers = (
         "query returned more than",
         "response size exceeded",
@@ -119,12 +123,13 @@ class RpcClient:
             code = int(error.get("code", -1))
             message = str(error.get("message", "unknown error"))
             RPC_REQUESTS.labels(self.chain_key, method, str(code)).inc()
+            data = error.get("data")
             error_type = (
                 RpcRangeTooLarge
-                if method == "eth_getLogs" and is_range_error(code, message)
+                if method == "eth_getLogs" and is_range_error(code, message, data)
                 else RpcError
             )
-            raise error_type(code, message, error.get("data"))
+            raise error_type(code, message, data)
         if response.status != 200:
             RPC_REQUESTS.labels(self.chain_key, method, str(response.status)).inc()
             raise RpcError(response.status, response.text[:500])
