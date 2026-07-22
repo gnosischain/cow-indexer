@@ -1,35 +1,85 @@
 from __future__ import annotations
 
 import asyncio
+import random
+from datetime import timedelta
 
 import structlog
 
 from cow_indexer.config import ChainConfig, RuntimeConfig
-from cow_indexer.observability import WORK_QUEUE, HealthServer
+from cow_indexer.observability import HealthServer
 from cow_indexer.services.enrichment import EnrichmentService
 from cow_indexer.services.historical import HistoricalIndexer
 from cow_indexer.sources.cow_api import AsyncRateLimiter, CowApiClient
 from cow_indexer.sources.rpc import RpcClient
 from cow_indexer.storage.clickhouse import ClickHouseStore
-from cow_indexer.utils import normalize_auction_order
+from cow_indexer.utils import normalize_auction_order, utcnow
 
 log = structlog.get_logger()
 
+_MAX_BACKOFF_SECONDS = 300.0
+
 
 async def _resilient_loop(name: str, chain: ChainConfig, action, interval: float) -> None:
+    # On repeated failures, back off exponentially (capped) instead of hammering at the
+    # base interval — a deliberately memory-capped FINAL that fails must not become a
+    # query storm. A clean run resets the backoff.
+    failures = 0
     while True:
         try:
             await action()
+            failures = 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            failures += 1
             log.error(
                 "continuous_worker_error",
                 worker=name,
                 chain=chain.key,
+                failures=failures,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        await asyncio.sleep(interval)
+        if failures == 0:
+            delay = interval
+        else:
+            delay = min(_MAX_BACKOFF_SECONDS, interval * (2 ** min(failures, 10)))
+        await asyncio.sleep(delay)
+
+
+async def _purge_loop(
+    chains: list[ChainConfig], store: ClickHouseStore, runtime: RuntimeConfig
+) -> None:
+    """One process-wide maintenance task that trims terminal work_items so the queue
+    stays small. It visits chains sequentially (work_items is a single unpartitioned
+    table and mutations serialize), runs one bounded batch per chain per sweep, never
+    overlaps another purge, and backs off on error. Disabled via COW_PURGE_ENABLED
+    during a one-time backlog cleanup so it does not race the `purge-work` CLI."""
+    if not runtime.purge_enabled:
+        log.info("purge_disabled")
+        return
+    # Wait before the first sweep so startup isn't competing with a mutation.
+    await asyncio.sleep(runtime.purge_interval_seconds)
+    failures = 0
+    while True:
+        try:
+            cutoff = utcnow() - timedelta(hours=runtime.purge_grace_hours)
+            purged = 0
+            for chain in chains:
+                purged += await store.purge_finished_work(chain, cutoff, runtime.purge_batch)
+            failures = 0
+            log.info("purge_sweep", purged=purged, chains=len(chains))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures += 1
+            log.error(
+                "purge_error", failures=failures, error=f"{type(exc).__name__}: {exc}"
+            )
+        base = runtime.purge_interval_seconds
+        delay = base if failures == 0 else min(3600.0, base * (2 ** min(failures, 6)))
+        # Jitter so restarts/replicas don't align their sweeps on the shared table.
+        await asyncio.sleep(delay * random.uniform(0.9, 1.1))
 
 
 async def run_continuous(
@@ -82,11 +132,6 @@ async def run_continuous(
                 async def enrich_action(service=enrichment) -> None:
                     await service.run_once()
 
-                async def queue_depth_action(current_chain=chain) -> None:
-                    WORK_QUEUE.labels(current_chain.key).set(
-                        await store.pending_work_count(current_chain)
-                    )
-
                 async def token_metadata_action(current_chain=chain, current_rpc=rpc) -> None:
                     have = set(await store.tokens_with_metadata(current_chain))
                     pending = [
@@ -120,12 +165,14 @@ async def run_continuous(
                 group.create_task(_resilient_loop("rpc", chain, scan_action, 12.0))
                 group.create_task(_resilient_loop("competition", chain, competition_action, 30.0))
                 group.create_task(_resilient_loop("enrichment", chain, enrich_action, 1.0))
-                group.create_task(_resilient_loop("queue-depth", chain, queue_depth_action, 30.0))
                 group.create_task(_resilient_loop("active-orders", chain, active_action, 60.0))
                 group.create_task(_resilient_loop("token-prices", chain, token_price_action, 300.0))
                 group.create_task(
                     _resilient_loop("token-metadata", chain, token_metadata_action, 300.0)
                 )
+            # One global, serialized retention task (NOT per-chain) trims terminal
+            # work_items so lease_work's FINAL never scans an unbounded table.
+            group.create_task(_purge_loop(chains, store, runtime))
     finally:
         await server.close()
         await asyncio.gather(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -19,6 +20,7 @@ from cow_indexer.services.validation import ValidationService
 from cow_indexer.sources.exports.manifest import load_manifest
 from cow_indexer.sources.rpc import RpcClient
 from cow_indexer.storage.clickhouse import ClickHouseStore
+from cow_indexer.utils import utcnow
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -116,6 +118,42 @@ def continuous(
         asyncio.run(run())
     except KeyboardInterrupt:
         pass
+
+
+@app.command("purge-work")
+def purge_work(
+    chain: Annotated[str, typer.Option("--chain")] = "all",
+    grace_hours: Annotated[float, typer.Option("--grace-hours", min=0)] = 24.0,
+    batch: Annotated[int, typer.Option("--batch", min=1)] = 50000,
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Delete aged terminal work_items in bounded, serial batches (one-time backlog
+    cleanup). Run with the scheduled purge disabled (COW_PURGE_ENABLED=false) and the
+    continuous process paused so the two do not race on the shared table."""
+
+    async def run() -> None:
+        indexer_config = load_config(config)
+        store = await ClickHouseStore(
+            ClickHouseConfig.from_env(), indexer_config.project_root
+        ).connect()
+        cutoff = utcnow() - timedelta(hours=grace_hours)
+        output: dict[str, int] = {}
+        try:
+            for selected in indexer_config.select(chain):
+                total = 0
+                while True:
+                    purged = await store.purge_finished_work(selected, cutoff, batch)
+                    total += purged
+                    _print({"chain": selected.key, "purged_batch": purged, "purged_total": total})
+                    # A short batch means no aged terminal work_ids remain for this chain.
+                    if purged < batch:
+                        break
+                output[selected.key] = total
+            _print({"purged": output})
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
 
 @app.command()

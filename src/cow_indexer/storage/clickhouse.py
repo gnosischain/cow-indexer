@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterable
 from datetime import datetime, timedelta
@@ -31,6 +32,32 @@ MAX_REVISION = 2**64 - 1
 # Terminal work status for competitions the public API does not serve; sits just
 # below `done`/`dead` so it wins the ReplacingMergeTree merge and lease_work skips it.
 UNAVAILABLE_REVISION = MAX_REVISION - 2
+
+# The three terminal work statuses. A terminal row always carries one of the top
+# revisions above, so a retry (small revision) can never write over one; the presence
+# of a terminal-status row therefore means the work_id is terminal. Retention deletes
+# every version of such work_ids (see purge_finished_work).
+TERMINAL_WORK_STATUSES = ("done", "dead", "unavailable_from_public_api")
+
+# Per-query memory ceiling for continuous-path FINAL reads. Well under the instance
+# limit so a single oversized FINAL fails in isolation (and the loop backs off)
+# instead of tripping the OvercommitTracker and cascading to ingestion. max_memory_usage
+# is per-query/per-server, not an aggregate limit, so it is paired with a process-wide
+# semaphore (ClickHouseStore._final_gate) capping concurrent FINAL reads.
+FINAL_QUERY_MEMORY = 128 * 1024 * 1024  # 128 MiB
+MAX_CONCURRENT_FINAL = 2
+
+# Settings for the retention DELETE: bound the IN-set memory and force a synchronous
+# lightweight delete so a batch is fully applied (and its rows masked from the next
+# SELECT) before the next batch is chosen — which is what makes the drain terminate.
+PURGE_SETTINGS = {
+    "max_memory_usage": FINAL_QUERY_MEMORY,
+    "max_rows_in_set": 50_000,
+    "max_bytes_in_set": 64 * 1024 * 1024,
+    "max_threads": 2,
+    "lightweight_delete_mode": "lightweight_update_force",
+    "lightweight_deletes_sync": 2,
+}
 
 
 def _winning_solution(solutions: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -74,6 +101,9 @@ class ClickHouseStore:
         self.database = config.database
         self.quoted_database = quote_database(config.database)
         self.client: Any = None
+        # Process-wide gate limiting how many continuous-path FINAL reads run at once.
+        # Created lazily inside the running loop so it binds to the correct event loop.
+        self._final_semaphore: asyncio.Semaphore | None = None
 
     async def connect(self) -> ClickHouseStore:
         if self.client is None:
@@ -136,6 +166,13 @@ class ClickHouseStore:
     async def _ensure(self) -> None:
         if self.client is None:
             await self.connect()
+
+    def _final_gate(self) -> asyncio.Semaphore:
+        """Process-wide limiter for concurrent FINAL reads on the continuous path.
+        Created on first use so it binds to the active event loop."""
+        if self._final_semaphore is None:
+            self._final_semaphore = asyncio.Semaphore(MAX_CONCURRENT_FINAL)
+        return self._final_semaphore
 
     async def _insert(self, table: str, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -736,18 +773,21 @@ class ClickHouseStore:
 
     async def lease_work(self, chain: ChainConfig, worker_id: str, limit: int) -> list[WorkItem]:
         await self._ensure()
-        result = await self.client.query(
-            f"SELECT work_id, kind, key, payload, attempts FROM {self.quoted_database}.work_items FINAL "
-            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
-            "AND ((status = 'pending' AND next_attempt_at <= now64(3)) "
-            "OR (status = 'running' AND lease_until < now64(3))) "
-            "ORDER BY next_attempt_at LIMIT {limit:UInt32}",
-            parameters={
-                "environment": chain.environment,
-                "chain_id": chain.chain_id,
-                "limit": limit,
-            },
-        )
+        async with self._final_gate():
+            result = await self.client.query(
+                f"SELECT work_id, kind, key, payload, attempts "
+                f"FROM {self.quoted_database}.work_items FINAL "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                "AND ((status = 'pending' AND next_attempt_at <= now64(3)) "
+                "OR (status = 'running' AND lease_until < now64(3))) "
+                "ORDER BY next_attempt_at LIMIT {limit:UInt32}",
+                parameters={
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "limit": limit,
+                },
+                settings={"max_memory_usage": FINAL_QUERY_MEMORY},
+            )
         now = utcnow()
         items: list[WorkItem] = []
         versions: list[dict[str, Any]] = []
@@ -844,40 +884,44 @@ class ClickHouseStore:
 
     async def active_order_uids(self, chain: ChainConfig, limit: int = 1000) -> list[str]:
         await self._ensure()
-        result = await self.client.query(
-            f"SELECT order_uid FROM {self.quoted_database}.orders FINAL "
-            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
-            "AND status IN ('open', 'presignaturePending') LIMIT {limit:UInt32}",
-            parameters={
-                "environment": chain.environment,
-                "chain_id": chain.chain_id,
-                "limit": limit,
-            },
-        )
+        async with self._final_gate():
+            result = await self.client.query(
+                f"SELECT order_uid FROM {self.quoted_database}.orders FINAL "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                "AND status IN ('open', 'presignaturePending') LIMIT {limit:UInt32}",
+                parameters={
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "limit": limit,
+                },
+                settings={"max_memory_usage": FINAL_QUERY_MEMORY},
+            )
         return [row[0] for row in result.result_rows]
 
     async def known_tokens(self, chain: ChainConfig, limit: int = 500) -> list[str]:
         await self._ensure()
-        result = await self.client.query(
-            f"SELECT token FROM ("
-            f"SELECT sell_token AS token FROM {self.quoted_database}.orders FINAL "
-            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
-            "UNION DISTINCT "
-            f"SELECT buy_token AS token FROM {self.quoted_database}.orders FINAL "
-            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
-            "UNION DISTINCT "
-            f"SELECT sell_token AS token FROM {self.quoted_database}.trades FINAL "
-            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
-            "UNION DISTINCT "
-            f"SELECT buy_token AS token FROM {self.quoted_database}.trades FINAL "
-            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64}) "
-            "WHERE token != '' LIMIT {limit:UInt32}",
-            parameters={
-                "environment": chain.environment,
-                "chain_id": chain.chain_id,
-                "limit": limit,
-            },
-        )
+        async with self._final_gate():
+            result = await self.client.query(
+                f"SELECT token FROM ("
+                f"SELECT sell_token AS token FROM {self.quoted_database}.orders FINAL "
+                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+                "UNION DISTINCT "
+                f"SELECT buy_token AS token FROM {self.quoted_database}.orders FINAL "
+                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+                "UNION DISTINCT "
+                f"SELECT sell_token AS token FROM {self.quoted_database}.trades FINAL "
+                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+                "UNION DISTINCT "
+                f"SELECT buy_token AS token FROM {self.quoted_database}.trades FINAL "
+                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64}) "
+                "WHERE token != '' LIMIT {limit:UInt32}",
+                parameters={
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "limit": limit,
+                },
+                settings={"max_memory_usage": FINAL_QUERY_MEMORY},
+            )
         return [row[0] for row in result.result_rows]
 
     async def tokens_with_metadata(self, chain: ChainConfig) -> list[str]:
@@ -909,15 +953,52 @@ class ClickHouseStore:
             ],
         )
 
-    async def pending_work_count(self, chain: ChainConfig) -> int:
+    async def purge_finished_work(
+        self, chain: ChainConfig, cutoff: datetime, batch: int = 50_000
+    ) -> int:
+        """Delete every version of terminal (done/dead/unavailable) work items whose
+        latest write predates `cutoff`, keeping `work_items` small so `lease_work FINAL`
+        never scans an unbounded table. Bounded and FINAL-free: select at most `batch`
+        aged terminal work_ids, then delete all their versions. Returns the number of
+        work_ids purged so the caller can decide whether another batch is due.
+
+        This is finite-window deduplication, NOT permanent completion: after a work_id
+        is purged, a later deterministic rediscovery (finality rescan, latest
+        competition, import, enrichment fanout) re-creates a fresh pending item. That is
+        safe because handler writes are idempotent; it only costs API calls, which the
+        grace window bounds. Still-open items carry no terminal-status row, so they are
+        never selected.
+        """
         await self._ensure()
-        result = await self.client.query(
-            f"SELECT count() FROM {self.quoted_database}.work_items FINAL "
-            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
-            "AND status = 'pending'",
+        async with self._final_gate():
+            selected = await self.client.query(
+                f"SELECT DISTINCT work_id FROM {self.quoted_database}.work_items "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                "AND status IN ('done', 'dead', 'unavailable_from_public_api') "
+                "AND observed_at < {cutoff:DateTime64(3)} "
+                "LIMIT {batch:UInt32}",
+                parameters={
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "cutoff": cutoff,
+                    "batch": batch,
+                },
+                settings={"max_memory_usage": FINAL_QUERY_MEMORY, "max_threads": 2},
+            )
+        work_ids = [row[0] for row in selected.result_rows]
+        if not work_ids:
+            return 0
+        # work_id is a sha256 hex digest (see enqueue_work_many), so inlining the list
+        # is injection-safe and avoids a huge server-side array parameter.
+        id_list = "','".join(work_ids)
+        await self.client.command(
+            f"DELETE FROM {self.quoted_database}.work_items "
+            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+            f"AND work_id IN ('{id_list}')",
             parameters={"environment": chain.environment, "chain_id": chain.chain_id},
+            settings=PURGE_SETTINGS,
         )
-        return int(result.result_rows[0][0]) if result.result_rows else 0
+        return len(work_ids)
 
     async def import_rows(
         self, manifest: Any, dataset: str, rows: list[dict[str, Any]], bundle_id: str

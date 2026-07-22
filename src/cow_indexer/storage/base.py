@@ -70,7 +70,9 @@ class Storage(Protocol):
     async def store_token_metadata(
         self, chain: ChainConfig, token: str, metadata: dict[str, Any], source: str
     ) -> None: ...
-    async def pending_work_count(self, chain: ChainConfig) -> int: ...
+    async def purge_finished_work(
+        self, chain: ChainConfig, cutoff: datetime, batch: int = 50_000
+    ) -> int: ...
     async def import_rows(
         self,
         manifest: Any,

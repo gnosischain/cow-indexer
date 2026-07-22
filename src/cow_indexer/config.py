@@ -130,6 +130,13 @@ class RuntimeConfig(BaseModel):
     enrich_concurrency: int = 6
     max_attempts: int = 6
     api_key: str | None = None
+    # Scheduled retention of terminal work_items so the queue stays small and the
+    # lease_work FINAL never scans an unbounded table. Disable during a one-time
+    # backlog cleanup (run the `purge-work` CLI instead) so the two don't overlap.
+    purge_enabled: bool = True
+    purge_interval_seconds: float = 900.0
+    purge_grace_hours: float = 24.0
+    purge_batch: int = 50000
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -146,6 +153,10 @@ class RuntimeConfig(BaseModel):
             enrich_concurrency=int(os.getenv("COW_ENRICH_CONCURRENCY", "6")),
             max_attempts=int(os.getenv("COW_MAX_ATTEMPTS", "6")),
             api_key=api_key,
+            purge_enabled=os.getenv("COW_PURGE_ENABLED", "true").lower() in {"1", "true", "yes"},
+            purge_interval_seconds=float(os.getenv("COW_PURGE_INTERVAL_SECONDS", "900")),
+            purge_grace_hours=float(os.getenv("COW_PURGE_GRACE_HOURS", "24")),
+            purge_batch=int(os.getenv("COW_PURGE_BATCH", "50000")),
         )
 
 

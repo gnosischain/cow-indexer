@@ -10,7 +10,7 @@ from cow_indexer.config import ChainConfig, RuntimeConfig
 from cow_indexer.models import WorkItem
 from cow_indexer.sources.cow_api import CompetitionUnavailable, CowApiClient
 from cow_indexer.storage.base import Storage
-from cow_indexer.utils import normalize_order_uid, utcnow
+from cow_indexer.utils import normalize_auction_order, normalize_order_uid, utcnow
 
 log = structlog.get_logger()
 
@@ -177,6 +177,9 @@ class EnrichmentService:
 
     async def _fanout_competition(self, payload: dict[str, Any]) -> None:
         auction = payload.get("auction") or {}
+        # auction.orders may be bare UID strings or expanded order objects; normalize
+        # both (order.get() on a str raises 'str' object has no attribute 'get').
         for order in auction.get("orders", []):
-            if uid := order.get("uid") or order.get("orderUid"):
-                await self.store.enqueue_work(self.chain, "order_uid", uid)
+            normalized = normalize_auction_order(order)
+            if normalized:
+                await self.store.enqueue_work(self.chain, "order_uid", normalized[0])

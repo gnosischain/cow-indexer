@@ -12,7 +12,6 @@ RPC_REQUESTS = Counter("cow_rpc_requests_total", "RPC requests", ["chain", "meth
 API_REQUESTS = Counter("cow_api_requests_total", "CoW API requests", ["chain", "route", "status"])
 ROWS_WRITTEN = Counter("cow_rows_written_total", "Rows written", ["chain", "table"])
 CHAIN_LAG = Gauge("cow_chain_lag_blocks", "Safe head minus checkpoint", ["chain"])
-WORK_QUEUE = Gauge("cow_work_queue_items", "Pending work items", ["chain"])
 REQUEST_LATENCY = Histogram("cow_request_seconds", "External request latency", ["source", "chain"])
 
 

@@ -155,7 +155,7 @@ Event discovery creates deterministic work identities for:
 
 CoW API order lookups are split into the documented maximum of 128 UIDs; leased `order_uid` work items share one batched fetch. Account orders and v2 trades paginate with 1,000-row pages until a short page is received. `curl_cffi` browser TLS impersonation is used because CoW's edge distinguishes (and blocks) ordinary Python TLS clients — this is required even with an API key, which is sent as `X-API-Key`. A single rate limiter is shared across all chains (they hit the same host and key); it uses bounded exponential backoff on retryable statuses and additionally backs the global rate off toward `COW_API_MAX_INTERVAL_SECONDS` on `429`/`403`, recovering as requests succeed.
 
-The ClickHouse work queue is append-only and restart-safe. Terminal revisions prevent a replayed chain range from reviving completed work. A competition the public API no longer serves is marked terminal `unavailable_from_public_api` (recorded, not retried, not dead-lettered). Run only one enrichment worker replica for a given `(environment, chain_id)`; ClickHouse does not provide a transactional competing-consumer lease.
+The ClickHouse work queue is append-only and restart-safe. Terminal revisions (`done`/`dead`/`unavailable_from_public_api`) dominate the ReplacingMergeTree merge, so a replayed chain range cannot revive completed work *while those rows exist*. To keep the queue bounded (an unbounded `work_items` makes `lease_work`'s `FINAL` an OOM risk), a scheduled maintenance task deletes every version of terminal work items older than a grace window (`COW_PURGE_GRACE_HOURS`, default 24h). This is finite-window deduplication, not permanent completion: after a terminal work item is purged, a later deterministic rediscovery (finality rescan, latest competition, import, enrichment fanout) re-creates a fresh pending item and re-enriches it — safe because handler writes are idempotent, at the cost of some API calls. Purging is serialized process-wide and can be disabled (`COW_PURGE_ENABLED=false`) for a one-time bulk cleanup via `purge-work`. A competition the public API no longer serves is marked terminal `unavailable_from_public_api` (recorded, not retried, not dead-lettered). Run only one enrichment worker replica for a given `(environment, chain_id)`; ClickHouse does not provide a transactional competing-consumer lease.
 
 ## Observability
 
@@ -169,11 +169,12 @@ Exported metrics (labeled by chain):
 
 - `cow_chain_lag_blocks{chain}` — safe head minus the committed scan position
 - `cow_rows_written_total{chain,table}` — rows written per table
-- `cow_work_queue_items{chain}` — pending enrichment work
 - `cow_rpc_requests_total{chain,method,status}` and `cow_api_requests_total{chain,route,status}` — request counts (the API metric is labeled by templated route, not the per-UID path, to bound series cardinality)
 - `cow_request_seconds{source,chain}` — RPC/API latency histogram
 
-Logs are structured JSON on stdout. During a backfill, watch `cow_rows_written_total` increasing and the `range_indexed` log line advancing; `cow_chain_lag_blocks` and `cow_work_queue_items` are legitimately large until a chain catches up, so alert on "no rows written" and pod health rather than on lag/backlog thresholds during the initial backfill.
+There is deliberately no exact pending-work gauge: an exact latest-state count on the append-only `work_items` requires a full-table `FINAL`, which is the OOM this design removes. Track backlog via `cow_rows_written_total` progress and the `purge_sweep` log line instead.
+
+Logs are structured JSON on stdout. During a backfill, watch `cow_rows_written_total` increasing and the `range_indexed` log line advancing; `cow_chain_lag_blocks` is legitimately large until a chain catches up, so alert on "no rows written" and pod health rather than on lag thresholds during the initial backfill.
 
 ## Recovering from failures
 
@@ -263,5 +264,5 @@ Integration tests require ClickHouse and are marked `integration`. Live tests re
 - Set `COW_API_KEY`; keep RPC URLs, the API key, and PostgreSQL DSNs out of logs and committed configuration.
 - Use a dedicated ClickHouse database and credentials in production.
 - Back up ClickHouse before schema upgrades.
-- Alert on pod health and on "no rows written in an hour" (a stall), plus RPC/API error ratios, dead letters, and import conflicts. Treat `cow_chain_lag_blocks` and `cow_work_queue_items` thresholds as steady-state signals to enable only after the initial backfill catches up — they are legitimately large during it.
+- Alert on pod health and on "no rows written in an hour" (a stall), plus RPC/API error ratios, dead letters, and import conflicts. Treat `cow_chain_lag_blocks` thresholds as steady-state signals to enable only after the initial backfill catches up — it is legitimately large during it.
 - “Complete off-chain history” may only be claimed when a validated export manifest declares the required historical boundary.

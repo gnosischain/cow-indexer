@@ -160,6 +160,30 @@ class RpcClient:
     ) -> list[RpcLog]:
         if to_block < from_block:
             return []
+        try:
+            return await self._get_logs_once(from_block, to_block, addresses, topics)
+        except RpcRangeTooLarge:
+            raise
+        except RpcError as exc:
+            # Some providers reject an address array in eth_getLogs with -32602
+            # "invalid params" (a single address works). Fall back to one query per
+            # address and merge so a strict provider cannot stall the whole chain.
+            if exc.code == -32602 and len(addresses) > 1:
+                merged: list[RpcLog] = []
+                for address in addresses:
+                    merged.extend(
+                        await self._get_logs_once(from_block, to_block, [address], topics)
+                    )
+                return merged
+            raise
+
+    async def _get_logs_once(
+        self,
+        from_block: int,
+        to_block: int,
+        addresses: list[str],
+        topics: list[str | list[str] | None] | None = None,
+    ) -> list[RpcLog]:
         params: dict[str, Any] = {
             "fromBlock": hex(from_block),
             "toBlock": hex(to_block),

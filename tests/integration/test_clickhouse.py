@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -256,5 +256,59 @@ async def test_checkpoint_queue_and_reconciliation_round_trip() -> None:
             parameters={"environment": chain.environment},
         )
         assert canonical.result_rows[0][0] == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_purge_trims_terminal_work_and_allows_rediscovery() -> None:
+    store = await ClickHouseStore(ClickHouseConfig.from_env(), ROOT).connect()
+    test_id = uuid.uuid4().hex
+    chain = (
+        load_config(ROOT / "config" / "chains.yaml")
+        .select("sepolia")[0]
+        .model_copy(update={"environment": f"purge-{test_id}"})
+    )
+    done_uid = "0x" + "a1" * 56
+    open_uid = "0x" + "b2" * 56
+    try:
+        await store.migrate()
+
+        # One item taken through pending -> running -> done (separate inserts, so its
+        # versions land in separate parts). The pending item is enqueued afterwards so
+        # it is not swept up in the same lease.
+        await store.enqueue_work(chain, "order_uid", done_uid)
+        leased = await store.lease_work(chain, "purge-worker", 10)
+        done_item = next(item for item in leased if item.key == done_uid.lower())
+        await store.finish_work(done_item, True)
+        await store.enqueue_work(chain, "order_uid", open_uid)
+
+        # Cutoff in the future so the just-written terminal row qualifies as "aged".
+        cutoff = datetime.now(UTC) + timedelta(minutes=5)
+        purged = await store.purge_finished_work(chain, cutoff, batch=50_000)
+        assert purged == 1  # only the done item; the pending one is untouched
+
+        # Every version of the done work_id is gone...
+        remaining = await store.client.query(
+            f"SELECT count() FROM {store.quoted_database}.work_items "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "AND key={key:String}",
+            parameters={
+                "environment": chain.environment,
+                "chain_id": chain.chain_id,
+                "key": done_uid.lower(),
+            },
+        )
+        assert remaining.result_rows[0][0] == 0
+
+        # ...the still-open item survives and remains leaseable...
+        released = await store.lease_work(chain, "purge-worker", 10)
+        assert [item.key for item in released] == [open_uid.lower()]
+
+        # ...and re-discovering the purged uid re-creates a fresh, leaseable item
+        # (finite-window dedup, not permanent completion).
+        await store.enqueue_work(chain, "order_uid", done_uid)
+        rediscovered = await store.lease_work(chain, "purge-worker", 10)
+        assert done_uid.lower() in {item.key for item in rediscovered}
     finally:
         await store.close()

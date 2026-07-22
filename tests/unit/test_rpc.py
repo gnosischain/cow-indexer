@@ -44,6 +44,34 @@ async def test_non_range_error_with_non_200_status_stays_plain_rpc_error() -> No
     assert not isinstance(exc.value, RpcRangeTooLarge)
 
 
+class _AddrArrayRejector:
+    """Rejects an eth_getLogs address ARRAY with -32602, accepts a single address."""
+
+    def __init__(self) -> None:
+        self.addresses: list = []
+
+    async def request(self, method, url, *, params=None, json=None):
+        addr = json["params"][0].get("address")
+        self.addresses.append(addr)
+        if isinstance(addr, list):
+            return HttpResponse(200, {"jsonrpc": "2.0", "error": {"code": -32602, "message": "invalid params"}})
+        return HttpResponse(200, {"jsonrpc": "2.0", "result": []})
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_getlogs_falls_back_to_per_address_on_32602() -> None:
+    transport = _AddrArrayRejector()
+    client = RpcClient("https://rpc.example", "test", transport=transport)
+    a, b = "0x" + "11" * 20, "0x" + "22" * 20
+    logs = await client.get_logs(0, 100, [a, b])
+    assert logs == []
+    # first the rejected array, then one query per address
+    assert transport.addresses == [[a, b], a, b]
+
+
 @pytest.mark.asyncio
 async def test_non_json_503_is_plain_rpc_error() -> None:
     with pytest.raises(RpcError) as exc:
