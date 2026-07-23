@@ -11,6 +11,7 @@ import typer
 from cow_indexer import __version__
 from cow_indexer.config import ClickHouseConfig, RuntimeConfig, load_config
 from cow_indexer.observability import configure_logging
+from cow_indexer.services.backfill_orderbook import UID_BATCH_SIZE, BackfillOrderbookService
 from cow_indexer.services.continuous import run_continuous
 from cow_indexer.services.export_import import ExportImportService, inspect_bundle
 from cow_indexer.services.historical import HistoricalIndexer
@@ -355,6 +356,129 @@ def status(config: ConfigOption = DEFAULT_CONFIG) -> None:
         store = await _store(config)
         try:
             _print(await store.status())
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+backfill_orderbook_app = typer.Typer(
+    no_args_is_help=True,
+    help="Historical orderbook backfill: replay off-chain order history via the "
+    "public CoW API (probe -> seed-orders -> drain -> seed-owners -> drain).",
+)
+app.add_typer(backfill_orderbook_app, name="backfill-orderbook")
+
+
+async def _backfill_service(config_path: Path) -> tuple[Any, ClickHouseStore, BackfillOrderbookService]:
+    indexer_config = load_config(config_path)
+    store = await ClickHouseStore(
+        ClickHouseConfig.from_env(), indexer_config.project_root
+    ).connect()
+    return indexer_config, store, BackfillOrderbookService(store, RuntimeConfig.from_env())
+
+
+@backfill_orderbook_app.command("probe")
+def backfill_orderbook_probe(
+    chain: Annotated[str, typer.Option("--chain")] = "all",
+    per_chain: Annotated[int, typer.Option("--per-chain", min=1, max=UID_BATCH_SIZE)] = 5,
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Feasibility gate: fetch each chain's oldest-traded uids via by_uids and report
+    the hit rate (repeatable; misses mark the epoch the public API no longer serves)."""
+
+    async def run() -> None:
+        indexer_config, store, service = await _backfill_service(config)
+        try:
+            _print(await service.probe(indexer_config.select(chain), per_chain))
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+@backfill_orderbook_app.command("seed-orders")
+def backfill_orderbook_seed_orders(
+    chain: Annotated[str, typer.Option("--chain")] = "all",
+    limit: Annotated[int | None, typer.Option("--limit", min=1)] = None,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", min=1, max=UID_BATCH_SIZE)
+    ] = UID_BATCH_SIZE,
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Enqueue order_uids_batch items for traded uids missing from `orders`
+    (newest embedded validTo first; anti-joined SQL-side; idempotent re-seed)."""
+
+    async def run() -> None:
+        indexer_config, store, service = await _backfill_service(config)
+        try:
+            output = []
+            for selected in indexer_config.select(chain):
+                output.append(await service.seed_orders(selected, limit, batch_size))
+            _print(output)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+@backfill_orderbook_app.command("seed-owners")
+def backfill_orderbook_seed_owners(
+    chain: Annotated[str, typer.Option("--chain")] = "all",
+    limit: Annotated[int | None, typer.Option("--limit", min=1)] = None,
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Enqueue owner_orders_backfill items for every distinct trader (terminal work
+    states make re-seeding a no-op)."""
+
+    async def run() -> None:
+        indexer_config, store, service = await _backfill_service(config)
+        try:
+            output = []
+            for selected in indexer_config.select(chain):
+                output.append(await service.seed_owners(selected, limit))
+            _print(output)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+@backfill_orderbook_app.command("drain")
+def backfill_orderbook_drain(
+    chain: Annotated[str, typer.Option("--chain")] = "all",
+    run_seconds: Annotated[float | None, typer.Option("--run-seconds", min=1)] = None,
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Process ONLY the backfill work kinds with a dedicated rate limiter
+    (COW_BACKFILL_* knobs). Safe to run beside `continuous`; Ctrl-C safe (leases
+    expire and items are re-leased)."""
+
+    async def run() -> None:
+        indexer_config, store, service = await _backfill_service(config)
+        try:
+            _print(await service.drain(indexer_config.select(chain), run_seconds))
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+@backfill_orderbook_app.command("status")
+def backfill_orderbook_status(
+    chain: Annotated[str, typer.Option("--chain")] = "all",
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Per chain: backfill work-item counts by kind/status plus orders coverage per
+    source with min/max(creation_date)."""
+
+    async def run() -> None:
+        indexer_config, store, service = await _backfill_service(config)
+        try:
+            _print(await service.status(indexer_config.select(chain)))
         finally:
             await store.close()
 

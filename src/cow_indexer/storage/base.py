@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -54,7 +54,11 @@ class Storage(Protocol):
         self, chain: ChainConfig, token: str, payload: dict[str, Any], source: str
     ) -> None: ...
     async def lease_work(
-        self, chain: ChainConfig, worker_id: str, limit: int
+        self,
+        chain: ChainConfig,
+        worker_id: str,
+        limit: int,
+        kinds: Sequence[str] | None = None,
     ) -> list[WorkItem]: ...
     async def finish_work(
         self,

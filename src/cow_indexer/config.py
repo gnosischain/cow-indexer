@@ -152,6 +152,16 @@ class RuntimeConfig(BaseModel):
     purge_interval_seconds: float = 900.0
     purge_grace_hours: float = 24.0
     purge_batch: int = 50000
+    # Historical orderbook backfill (`backfill-orderbook drain`) runs its OWN
+    # CowApiClient around its OWN AsyncRateLimiter so the ~900K-call historical sweep
+    # never competes with (or slows) the live ingestion limiter. Deliberately slow
+    # defaults: ~2 RPS, backing off to one request per 10s under throttling.
+    backfill_interval_seconds: float = 0.5
+    backfill_max_interval_seconds: float = 10.0
+    backfill_concurrency: int = 2
+    # Owner enumeration pages at 1000 orders/page; 20 pages = 20K orders caps runaway
+    # accounts (bots) so one owner cannot monopolize the drain.
+    backfill_max_pages_per_owner: int = 20
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -174,6 +184,14 @@ class RuntimeConfig(BaseModel):
             purge_interval_seconds=float(os.getenv("COW_PURGE_INTERVAL_SECONDS", "900")),
             purge_grace_hours=float(os.getenv("COW_PURGE_GRACE_HOURS", "24")),
             purge_batch=int(os.getenv("COW_PURGE_BATCH", "50000")),
+            backfill_interval_seconds=float(os.getenv("COW_BACKFILL_INTERVAL_SECONDS", "0.5")),
+            backfill_max_interval_seconds=float(
+                os.getenv("COW_BACKFILL_MAX_INTERVAL_SECONDS", "10.0")
+            ),
+            backfill_concurrency=int(os.getenv("COW_BACKFILL_CONCURRENCY", "2")),
+            backfill_max_pages_per_owner=int(
+                os.getenv("COW_BACKFILL_MAX_PAGES_PER_OWNER", "20")
+            ),
         )
 
 

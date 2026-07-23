@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,14 @@ import structlog
 from clickhouse_connect.driver import httputil
 
 from cow_indexer.config import ChainConfig, ClickHouseConfig
-from cow_indexer.models import BlockHeader, DecodedEvent, ImportStats, RpcLog, WorkItem
+from cow_indexer.models import (
+    BACKFILL_WORK_KINDS,
+    BlockHeader,
+    DecodedEvent,
+    ImportStats,
+    RpcLog,
+    WorkItem,
+)
 from cow_indexer.observability import ROWS_WRITTEN
 from cow_indexer.storage.migrations import migration_files, quote_database, split_sql
 from cow_indexer.utils import (
@@ -56,6 +63,14 @@ PURGE_DELETE_SETTINGS = {
     "lightweight_delete_mode": "lightweight_update_force",
     "lightweight_deletes_sync": 2,
 }
+
+# Decode the validTo embedded in an order uid, in SQL. A uid is '0x' + 112 hex chars
+# (56 bytes: 32 order digest + 20 owner + 4 big-endian validTo). The validTo hex is
+# bytes 52..56 = payload hex chars 105..112 (1-based) = full-string chars 107..114,
+# so substring(order_uid, 107, 8) (1-based, length 8). unhex yields the 4 big-endian
+# bytes; reverse + reinterpretAsUInt32 (little-endian) recovers the uint32 epoch.
+# Python equivalent: int(uid[106:114], 16) — see backfill_orderbook.decode_valid_to.
+ORDER_UID_VALID_TO_SQL = "reinterpretAsUInt32(reverse(unhex(substring(order_uid, 107, 8))))"
 
 
 def _winning_solution(solutions: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -110,6 +125,17 @@ class ClickHouseStore:
             "max_threads": config.final_query_threads,
         }
         self._purge_settings = {**self._final_settings, **PURGE_DELETE_SETTINGS}
+        # The order seeder streams a full-chain distinct-uid scan with a GROUP BY
+        # + ORDER BY over every traded uid (~4.1M on mainnet). cow_db is a shared
+        # instance, so this MUST spill to disk rather than OOM cerebro's live
+        # queries as collateral: bound peak memory and let GROUP BY/sort spill.
+        seed_scan_mb = max(config.final_query_memory_mb, 2048)
+        self._seed_scan_settings = {
+            "max_memory_usage": seed_scan_mb * 1024 * 1024,
+            "max_bytes_before_external_group_by": (seed_scan_mb // 2) * 1024 * 1024,
+            "max_bytes_before_external_sort": (seed_scan_mb // 2) * 1024 * 1024,
+            "max_threads": config.final_query_threads,
+        }
 
     async def connect(self) -> ClickHouseStore:
         if self.client is None:
@@ -777,13 +803,31 @@ class ClickHouseStore:
             ],
         )
 
-    async def lease_work(self, chain: ChainConfig, worker_id: str, limit: int) -> list[WorkItem]:
+    async def lease_work(
+        self,
+        chain: ChainConfig,
+        worker_id: str,
+        limit: int,
+        kinds: Sequence[str] | None = None,
+    ) -> list[WorkItem]:
+        """Lease pending (or lease-expired) work items. ``kinds=None`` preserves the
+        live-loop behavior: every kind EXCEPT the dedicated backfill kinds, which only
+        the ``backfill-orderbook drain`` command processes (the live enrichment worker
+        would dead-letter them as unsupported). Pass an explicit tuple — e.g.
+        ``BACKFILL_WORK_KINDS`` — to lease only those kinds."""
         await self._ensure()
+        if kinds is None:
+            kind_clause = "AND kind NOT IN {excluded_kinds:Array(String)} "
+            kind_parameters: dict[str, Any] = {"excluded_kinds": list(BACKFILL_WORK_KINDS)}
+        else:
+            kind_clause = "AND kind IN {kinds:Array(String)} "
+            kind_parameters = {"kinds": list(kinds)}
         async with self._final_gate():
             result = await self.client.query(
                 f"SELECT work_id, kind, key, payload, attempts "
                 f"FROM {self.quoted_database}.work_items FINAL "
                 "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                f"{kind_clause}"
                 "AND ((status = 'pending' AND next_attempt_at <= now64(3)) "
                 "OR (status = 'running' AND lease_until < now64(3))) "
                 "ORDER BY next_attempt_at LIMIT {limit:UInt32}",
@@ -791,6 +835,7 @@ class ClickHouseStore:
                     "environment": chain.environment,
                     "chain_id": chain.chain_id,
                     "limit": limit,
+                    **kind_parameters,
                 },
                 settings=self._final_settings,
             )
@@ -1129,3 +1174,119 @@ class ClickHouseStore:
                 for row in result.result_rows
             ],
         }
+
+    async def oldest_traded_order_uids(
+        self, chain: ChainConfig, count: int = 5
+    ) -> list[tuple[str, datetime]]:
+        """The `count` order uids with the oldest first trade (min block_timestamp per
+        uid) — the probe set for the historical orderbook backfill feasibility gate."""
+        await self._ensure()
+        result = await self.client.query(
+            f"SELECT order_uid, min(block_timestamp) AS first_seen "
+            f"FROM {self.quoted_database}.trades "
+            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+            "AND block_timestamp IS NOT NULL "
+            "GROUP BY order_uid ORDER BY first_seen ASC LIMIT {count:UInt32}",
+            parameters={
+                "environment": chain.environment,
+                "chain_id": chain.chain_id,
+                "count": count,
+            },
+        )
+        return [(row[0], row[1]) for row in result.result_rows]
+
+    async def stream_missing_traded_order_uids(
+        self, chain: ChainConfig, limit: int | None = None
+    ) -> AsyncIterator[list[str]]:
+        """Stream blocks of distinct traded order uids that are absent from `orders`,
+        newest embedded validTo first (with a uid tiebreaker so the stream order — and
+        therefore the seeder's batch composition and work_ids — is deterministic).
+
+        The anti-join runs SQL-side: pre-backfill `orders` is small (~100K rows per
+        chain), so the NOT IN hash set is cheap server-side, and it saves shipping
+        millions of trade uids to the client only to discard most of them on re-seeds.
+        As the backfill lands, `orders` converges on the traded-uid set and the same
+        query shrinks toward zero output — re-seeding stays cheap in rows even though
+        the set grows. Blocks are fetched lazily (query_row_block_stream), so client
+        memory stays bounded even for the ~4M-uid mainnet seed."""
+        await self._ensure()
+        sql = (
+            f"SELECT order_uid FROM {self.quoted_database}.trades "
+            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+            "AND order_uid NOT IN ("
+            f"SELECT order_uid FROM {self.quoted_database}.orders "
+            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64}) "
+            "GROUP BY order_uid "
+            f"ORDER BY {ORDER_UID_VALID_TO_SQL} DESC, order_uid"
+        )
+        if limit is not None:
+            sql += " LIMIT {limit:UInt64}"
+        parameters: dict[str, Any] = {
+            "environment": chain.environment,
+            "chain_id": chain.chain_id,
+        }
+        if limit is not None:
+            parameters["limit"] = limit
+        stream = await self.client.query_row_block_stream(
+            sql, parameters=parameters, settings=self._seed_scan_settings
+        )
+        # The block iteration is synchronous (clickhouse-connect streams via the sync
+        # client under an executor); acceptable because the seeder CLI is the only
+        # task in its process.
+        with stream:
+            for block in stream:
+                yield [row[0] for row in block]
+
+    async def count_distinct_traded_order_uids(self, chain: ChainConfig) -> int:
+        """uniqExact of traded order uids — lets the seeder report how many uids the
+        SQL-side anti-join skipped as already present in `orders`."""
+        await self._ensure()
+        result = await self.client.query(
+            f"SELECT uniqExact(order_uid) FROM {self.quoted_database}.trades "
+            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64}",
+            parameters={"environment": chain.environment, "chain_id": chain.chain_id},
+        )
+        return int(result.result_rows[0][0]) if result.result_rows else 0
+
+    async def distinct_trade_owners(
+        self, chain: ChainConfig, limit: int | None = None
+    ) -> list[str]:
+        """Every distinct trader address for the chain (sorted, so seeding order and
+        work identity are deterministic). Buffered: even mainnet holds well under a
+        million owners, a few tens of MB at most."""
+        await self._ensure()
+        sql = (
+            f"SELECT owner FROM {self.quoted_database}.trades "
+            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+            "AND owner != '' GROUP BY owner ORDER BY owner"
+        )
+        parameters: dict[str, Any] = {
+            "environment": chain.environment,
+            "chain_id": chain.chain_id,
+        }
+        if limit is not None:
+            sql += " LIMIT {limit:UInt64}"
+            parameters["limit"] = limit
+        result = await self.client.query(sql, parameters=parameters)
+        return [row[0] for row in result.result_rows]
+
+    async def backfill_work_counts(self, chain: ChainConfig) -> dict[str, dict[str, int]]:
+        """Per-kind, per-status counts of the two backfill work kinds, with the same
+        FINAL semantics (and memory cap + concurrency gate) as lease_work."""
+        await self._ensure()
+        async with self._final_gate():
+            result = await self.client.query(
+                f"SELECT kind, status, count() FROM {self.quoted_database}.work_items FINAL "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                "AND kind IN {kinds:Array(String)} GROUP BY kind, status",
+                parameters={
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "kinds": list(BACKFILL_WORK_KINDS),
+                },
+                settings=self._final_settings,
+            )
+        counts: dict[str, dict[str, int]] = {kind: {} for kind in BACKFILL_WORK_KINDS}
+        for kind, status, count in result.result_rows:
+            counts.setdefault(kind, {})[status] = int(count)
+        return counts

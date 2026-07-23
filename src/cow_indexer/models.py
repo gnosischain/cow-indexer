@@ -76,11 +76,26 @@ class DecodedEvent(BaseModel):
     block_timestamp: datetime | None = None
 
 
+# Work kinds processed exclusively by the historical orderbook backfill drain
+# (`backfill-orderbook drain`), never by the live continuous enrichment loop:
+# lease_work skips them unless the caller asks for them explicitly.
+BACKFILL_WORK_KINDS = ("order_uids_batch", "owner_orders_backfill")
+
+
 class WorkItem(BaseModel):
     work_id: str
     environment: str
     chain_id: int
-    kind: Literal["order_uid", "owner", "tx_hash", "tx_competition", "app_data", "token"]
+    kind: Literal[
+        "order_uid",
+        "owner",
+        "tx_hash",
+        "tx_competition",
+        "app_data",
+        "token",
+        "order_uids_batch",
+        "owner_orders_backfill",
+    ]
     key: str
     payload: dict[str, Any] = Field(default_factory=dict)
     attempts: int = 0

@@ -134,6 +134,7 @@ Each mode is a subcommand of the same binary; they share the ClickHouse schema a
 | Continuous | `continuous --chain <all\|key>` | Long-running service: forward scan + finality-window rescan + competitions + active orders + enrichment + token prices, per chain. Exposes `:9090`. |
 | Inspect / status | `status`, `coverage --chain <sel>`, `validate --chain <sel>` | Report per-chain checkpoints, historical coverage, and reconciliation checks. |
 | Export import | `inspect-export`, `import-export`, `validate-export` | Optional authoritative off-chain bundle import (see below). |
+| Orderbook backfill | `backfill-orderbook <probe\|seed-orders\|seed-owners\|drain\|status>` | Replay historical off-chain orders through the public API into `orders` (`source='backfill'`). Own rate limiter; safe beside `continuous` (see below). |
 
 Typical lifecycle: `preflight` → `migrate` → `continuous` (which backfills from each chain's pinned deployment block up to the tip and then tracks the head). `backfill` and `repair` are for bounded/one-shot work. In `continuous` mode every chain runs independently — a failing chain retries in isolation and does not stop the others. A fresh chain with no checkpoint starts at the earliest pinned `from_block` in its `deployments/*.json`; pin those blocks (not `0`) to avoid scanning from genesis.
 
@@ -156,6 +157,34 @@ Event discovery creates deterministic work identities for:
 CoW API order lookups are split into the documented maximum of 128 UIDs; leased `order_uid` work items share one batched fetch. Account orders and v2 trades paginate with 1,000-row pages until a short page is received. `curl_cffi` browser TLS impersonation is used because CoW's edge distinguishes (and blocks) ordinary Python TLS clients — this is required even with an API key, which is sent as `X-API-Key`. A single rate limiter is shared across all chains (they hit the same host and key); it uses bounded exponential backoff on retryable statuses and additionally backs the global rate off toward `COW_API_MAX_INTERVAL_SECONDS` on `429`/`403`, recovering as requests succeed.
 
 The ClickHouse work queue is append-only and restart-safe. Terminal revisions (`done`/`dead`/`unavailable_from_public_api`) dominate the ReplacingMergeTree merge, so a replayed chain range cannot revive completed work *while those rows exist*. To keep the queue bounded (an unbounded `work_items` makes `lease_work`'s `FINAL` an OOM risk), a scheduled maintenance task deletes every version of terminal work items older than a grace window (`COW_PURGE_GRACE_HOURS`, default 24h). This is finite-window deduplication, not permanent completion: after a terminal work item is purged, a later deterministic rediscovery (finality rescan, latest competition, import, enrichment fanout) re-creates a fresh pending item and re-enriches it — safe because handler writes are idempotent, at the cost of some API calls. Purging is serialized process-wide and can be disabled (`COW_PURGE_ENABLED=false`) for a one-time bulk cleanup via `purge-work`. A competition the public API no longer serves is marked terminal `unavailable_from_public_api` (recorded, not retried, not dead-lettered). Run only one enrichment worker replica for a given `(environment, chain_id)`; ClickHouse does not provide a transactional competing-consumer lease.
+
+## Historical orderbook backfill
+
+Live API capture only starts at deployment time, but the chain holds years of traded order uids and trader addresses. `backfill-orderbook` replays that off-chain history through the public CoW API into `orders` (`source='backfill'`) using the existing work queue, without touching the live ingestion path.
+
+**Feasibility gate (verified 2026-07):** the public API serves full order JSON for uids back to roughly 2022-07 (the orderbook migration epoch) on mainnet and xdai; 2021-era uids return 404 and are counted as missing data, never as failures. The `probe` command makes this gate repeatable. The 2021 epoch — and authoritative fields such as cancellation timestamps — remain reachable only via the export bundle path below: the Parquet bundle from CoW's Postgres stays the blessed bulk route, so ping the CoW team for an export in parallel with any large replay.
+
+Sequencing:
+
+```bash
+uv run cow-indexer backfill-orderbook probe --chain all           # repeat the gate
+uv run cow-indexer backfill-orderbook seed-orders --chain gnosis  # traded uids -> 128-uid batch items
+uv run cow-indexer backfill-orderbook drain --chain gnosis        # pass 1: executed orders
+uv run cow-indexer backfill-orderbook seed-owners --chain gnosis  # every trader -> owner item
+uv run cow-indexer backfill-orderbook drain --chain gnosis        # pass 2: never-executed orders
+uv run cow-indexer backfill-orderbook status --chain gnosis       # work counts + per-source coverage
+```
+
+- **Pass 1** (`order_uids_batch`): distinct traded uids missing from `orders`, anti-joined SQL-side and seeded newest embedded-validTo first so coverage grows contiguously backward from the live floor. One `POST /orders/by_uids` call per item (~97K calls total) instead of the per-uid enrichment fan-out (~37M).
+- **Pass 2** (`owner_orders_backfill`): one item per distinct trader, paged via `GET /account/{owner}/orders` (capped by `COW_BACKFILL_MAX_PAGES_PER_OWNER`, default 20 pages = 20K orders). Recovers expired/cancelled never-executed orders; owners who never traded stay invisible (disclosed).
+
+**Etiquette:** this is a ~900K-call sweep of a public API — run it WITH `COW_API_KEY` set. The drain uses its own rate limiter (`COW_BACKFILL_INTERVAL_SECONDS`, default `0.5` = 2 RPS, backing off toward `COW_BACKFILL_MAX_INTERVAL_SECONDS`, default `10`) and its own concurrency (`COW_BACKFILL_CONCURRENCY`, default `2`), fully separate from the live loop's limiter; both back off independently on `429`/`403`, so a throttled backfill never slows live ingestion. `lease_work` conversely hides the backfill kinds from the live enrichment worker, so `drain` is safe to run beside `continuous`.
+
+**Resume semantics:** progress lives in the work items themselves. Terminal states (`done`/`dead`) survive restarts, Ctrl-C only lets leases expire for re-lease, and re-seeding is a no-op: batch keys are sorted-canonical, so the same uid set (or owner) hashes to the same `work_id`, and a fresh revision-0 row always loses the merge against a terminal one. The uid pass is additionally self-healing via its anti-join — captured uids simply drop out of the next seed. Note the terminal-work purge (`COW_PURGE_GRACE_HOURS`) applies here too: re-seeding owners long after a completed drain re-enqueues them (idempotent writes, wasted API calls), so finish a seed→drain cycle within the grace window or expect re-fetches.
+
+**Semantics caveat:** backfilled `status:{status}` order events carry observation-time timestamps, not historical ones — pre-capture cancelled-unfilled orders have no cancel time and are treated as open until `valid_to` by downstream reconstruction (slight depth overstatement, disclosed, consistent).
+
+**Cerebro-side follow-ups (separate change set, after the backfill lands):** the CoW Explorer depth horizon becomes two-tier (full-fidelity floor = live capture start; reconstructed floor = `min(creation_date) WHERE source='backfill'`), and the order-grain query-memory re-verification sweep is a HARD gate before the deeper slider ships — `orders` grows from ~100K to ~10M rows and every order-grain dedup in cerebro must be re-checked against the 2 GiB budget.
 
 ## Observability
 
