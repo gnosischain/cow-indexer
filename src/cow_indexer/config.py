@@ -162,6 +162,13 @@ class RuntimeConfig(BaseModel):
     # Owner enumeration pages at 1000 orders/page; 20 pages = 20K orders caps runaway
     # accounts (bots) so one owner cannot monopolize the drain.
     backfill_max_pages_per_owner: int = 20
+    # Native-price sweep: each token is refetched at most once per
+    # price_refresh_seconds, and the sweep loop wakes every price_interval_seconds.
+    # Prices are analytics enrichment, not tip-critical — the old sweep (every known
+    # token, every 300s, per chain) was a sustained burst that periodically tripped
+    # CloudFront's edge block (403 "Request blocked") for the whole pod.
+    price_interval_seconds: float = 900.0
+    price_refresh_seconds: float = 3600.0
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -192,6 +199,8 @@ class RuntimeConfig(BaseModel):
             backfill_max_pages_per_owner=int(
                 os.getenv("COW_BACKFILL_MAX_PAGES_PER_OWNER", "20")
             ),
+            price_interval_seconds=float(os.getenv("COW_PRICE_INTERVAL_SECONDS", "900")),
+            price_refresh_seconds=float(os.getenv("COW_PRICE_REFRESH_SECONDS", "3600")),
         )
 
 

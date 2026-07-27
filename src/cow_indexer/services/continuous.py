@@ -10,7 +10,7 @@ from cow_indexer.config import ChainConfig, RuntimeConfig
 from cow_indexer.observability import HealthServer
 from cow_indexer.services.enrichment import EnrichmentService
 from cow_indexer.services.historical import HistoricalIndexer
-from cow_indexer.sources.cow_api import AsyncRateLimiter, CowApiClient
+from cow_indexer.sources.cow_api import AsyncRateLimiter, CowApiClient, CowApiError
 from cow_indexer.sources.rpc import RpcClient
 from cow_indexer.storage.clickhouse import ClickHouseStore
 from cow_indexer.utils import normalize_auction_order, utcnow
@@ -157,8 +157,39 @@ async def run_continuous(
                     await store.store_orders(current_chain, orders, "api")
 
                 async def token_price_action(current_chain=chain, current_api=api) -> None:
-                    for token in await store.known_tokens(current_chain):
-                        payload = await current_api.native_price(token)
+                    # Refresh only tokens whose stored price is older than the TTL.
+                    # Fetched tokens become fresh and drop out of the next sweep, so a
+                    # sweep interrupted by the edge resumes with the remainder instead
+                    # of restarting from the top and re-burning the request budget on
+                    # tokens it already priced.
+                    known = await store.known_tokens(current_chain)
+                    fresh = set(
+                        await store.tokens_with_fresh_price(
+                            current_chain, runtime.price_refresh_seconds
+                        )
+                    )
+                    throttled = 0
+                    for token in known:
+                        if token in fresh:
+                            continue
+                        try:
+                            payload = await current_api.native_price(token)
+                        except CowApiError as exc:
+                            if exc.status in (403, 429):
+                                throttled += 1
+                                # The edge is hard-blocking this pod; continuing only
+                                # extends the block window. Stop the sweep and let the
+                                # loop retry after price_interval_seconds.
+                                if throttled >= 3:
+                                    log.warning(
+                                        "price_sweep_blocked",
+                                        chain=current_chain.key,
+                                        status=exc.status,
+                                    )
+                                    return
+                            # A per-token failure must not abort the whole sweep.
+                            continue
+                        throttled = 0
                         if payload:
                             await store.store_native_price(current_chain, token, payload, "api")
 
@@ -170,7 +201,11 @@ async def run_continuous(
                     )
                 )
                 group.create_task(_resilient_loop("active-orders", chain, active_action, 60.0))
-                group.create_task(_resilient_loop("token-prices", chain, token_price_action, 300.0))
+                group.create_task(
+                    _resilient_loop(
+                        "token-prices", chain, token_price_action, runtime.price_interval_seconds
+                    )
+                )
                 group.create_task(
                     _resilient_loop("token-metadata", chain, token_metadata_action, 300.0)
                 )

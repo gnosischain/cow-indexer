@@ -975,6 +975,24 @@ class ClickHouseStore:
             )
         return [row[0] for row in result.result_rows]
 
+    async def tokens_with_fresh_price(
+        self, chain: ChainConfig, max_age_seconds: float
+    ) -> list[str]:
+        # Any row inside the window means fresh — duplicates are irrelevant, so no
+        # FINAL is needed on this small append-only table.
+        await self._ensure()
+        result = await self.client.query(
+            f"SELECT DISTINCT token FROM {self.quoted_database}.native_prices "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "AND observed_at >= now() - INTERVAL {max_age:UInt32} SECOND",
+            parameters={
+                "environment": chain.environment,
+                "chain_id": chain.chain_id,
+                "max_age": int(max_age_seconds),
+            },
+        )
+        return [row[0] for row in result.result_rows]
+
     async def tokens_with_metadata(self, chain: ChainConfig) -> list[str]:
         await self._ensure()
         result = await self.client.query(
