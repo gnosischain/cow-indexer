@@ -1080,6 +1080,46 @@ class ClickHouseStore:
         )
         return [row[0] for row in result.result_rows]
 
+    async def store_native_price_miss(
+        self, chain: ChainConfig, token: str, reason: str = "absent"
+    ) -> None:
+        """Record that the native-price endpoint has no price for this token.
+
+        native_price() uses allow_404, so a miss returns None with no exception and
+        store_native_price is never called -- leaving the token permanently absent from
+        native_prices and therefore never "fresh", so the sweep re-asks it every pass.
+        """
+        await self._insert(
+            "native_price_misses",
+            [
+                {
+                    "environment": chain.environment,
+                    "chain_id": chain.chain_id,
+                    "token": normalize_address(token),
+                    "reason": reason,
+                    "observed_at": utcnow(),
+                }
+            ],
+        )
+
+    async def tokens_with_recent_price_miss(
+        self, chain: ChainConfig, max_age_seconds: float
+    ) -> list[str]:
+        """Tokens whose last price attempt missed within the window. No FINAL: any row
+        inside the window is enough to skip, and the table holds one row per token."""
+        await self._ensure()
+        result = await self.client.query(
+            f"SELECT DISTINCT token FROM {self.quoted_database}.native_price_misses "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "AND observed_at >= now() - INTERVAL {max_age:UInt32} SECOND",
+            parameters={
+                "environment": chain.environment,
+                "chain_id": chain.chain_id,
+                "max_age": int(max_age_seconds),
+            },
+        )
+        return [row[0] for row in result.result_rows]
+
     async def tokens_with_metadata(self, chain: ChainConfig) -> list[str]:
         await self._ensure()
         result = await self.client.query(

@@ -175,6 +175,11 @@ class RuntimeConfig(BaseModel):
     # CloudFront's edge block (403 "Request blocked") for the whole pod.
     price_interval_seconds: float = 900.0
     price_refresh_seconds: float = 3600.0
+    # How long a 'this token has no native price' answer is trusted. Long on
+    # purpose: a token without a price almost never gains one, and re-asking is
+    # what made native_price 42-46% of all API traffic at a ~65-72% 404 rate.
+    # Bounded rather than permanent so a newly-priced token is still picked up.
+    price_miss_ttl_seconds: float = 604800.0  # 7 days
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -210,6 +215,7 @@ class RuntimeConfig(BaseModel):
             ),
             price_interval_seconds=float(os.getenv("COW_PRICE_INTERVAL_SECONDS", "900")),
             price_refresh_seconds=float(os.getenv("COW_PRICE_REFRESH_SECONDS", "3600")),
+            price_miss_ttl_seconds=float(os.getenv("COW_PRICE_MISS_TTL_SECONDS", "604800")),
         )
 
 

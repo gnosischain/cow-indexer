@@ -163,3 +163,65 @@ async def test_healthy_batch_reports_no_release() -> None:
     done = await service(store, FakeApi()).run_once(limit=10)
     assert done == 3
     assert store.released == []
+
+
+@pytest.mark.asyncio
+async def test_token_miss_is_recorded_so_it_is_not_re_asked() -> None:
+    """A 404 price must be written to the negative cache.
+
+    native_price uses allow_404, so a miss returns None with no exception and
+    store_native_price is never called. tokens_with_fresh_price reads native_prices,
+    which is only written on success -- so an unrecorded miss is never "fresh" and the
+    sweep re-asks it every price_interval_seconds (900s) forever. Measured 2026-09-16:
+    that path was 42-46% of ALL CoW API traffic at a ~65-72% 404 rate.
+    """
+
+    class NoPriceApi(FakeApi):
+        async def native_price(self, token):
+            return None
+
+    class TokenStore(FakeStore):
+        def __init__(self, items):
+            super().__init__(items)
+            self.price_misses: list[str] = []
+            self.prices: list[str] = []
+
+        async def store_native_price(self, chain, token, payload, source):
+            self.prices.append(token)
+
+        async def store_native_price_miss(self, chain, token, reason="absent"):
+            self.price_misses.append(token)
+
+    token = "0x" + "ab" * 20
+    store = TokenStore([work("token", token)])
+    done = await service(store, NoPriceApi()).run_once(limit=10)
+
+    assert done == 1
+    assert store.price_misses == [token], "the miss must be cached"
+    assert store.prices == [], "nothing should land in native_prices"
+    assert [ok for _, ok, _ in store.finished] == [True], "a miss is data, not a failure"
+
+
+@pytest.mark.asyncio
+async def test_token_hit_is_not_recorded_as_a_miss() -> None:
+    class PricedApi(FakeApi):
+        async def native_price(self, token):
+            return {"price": "123"}
+
+    class TokenStore(FakeStore):
+        def __init__(self, items):
+            super().__init__(items)
+            self.price_misses: list[str] = []
+            self.prices: list[str] = []
+
+        async def store_native_price(self, chain, token, payload, source):
+            self.prices.append(token)
+
+        async def store_native_price_miss(self, chain, token, reason="absent"):
+            self.price_misses.append(token)
+
+    token = "0x" + "cd" * 20
+    store = TokenStore([work("token", token)])
+    await service(store, PricedApi()).run_once(limit=10)
+    assert store.prices == [token]
+    assert store.price_misses == []

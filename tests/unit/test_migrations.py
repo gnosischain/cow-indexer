@@ -7,7 +7,7 @@ ROOT = Path(__file__).parents[2]
 
 def test_migrations_are_contiguous_and_split() -> None:
     files = migration_files(ROOT / "migrations")
-    assert [path.name[:3] for path in files] == [f"{index:03}" for index in range(9)]
+    assert [path.name[:3] for path in files] == [f"{index:03}" for index in range(10)]
     for path in files:
         assert split_sql(path.read_text())
 

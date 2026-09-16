@@ -237,6 +237,12 @@ class EnrichmentService:
             await self.store.store_api_payload(self.chain, "native_price", item.key, payload)
             if payload:
                 await self.store.store_native_price(self.chain, item.key, payload, "api")
+            else:
+                # Same negative cache as the sweep: _fanout_order enqueues a token item
+                # per sellToken/buyToken on every order, and purge retention recycles
+                # terminal items after purge_grace_hours, so an unrecorded miss is
+                # re-asked indefinitely.
+                await self.store.store_native_price_miss(self.chain, item.key)
         else:
             raise ValueError(f"unsupported work kind: {item.kind}")
 

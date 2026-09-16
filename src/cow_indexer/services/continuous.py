@@ -174,6 +174,14 @@ async def run_continuous(
                             current_chain, runtime.price_refresh_seconds
                         )
                     )
+                    # Tokens the endpoint has already said it has no price for. Without
+                    # this they are never "fresh" (nothing is written on a 404) and come
+                    # back every price_interval_seconds forever.
+                    fresh |= set(
+                        await store.tokens_with_recent_price_miss(
+                            current_chain, runtime.price_miss_ttl_seconds
+                        )
+                    )
                     throttled = 0
                     for token in known:
                         if token in fresh:
@@ -198,6 +206,10 @@ async def run_continuous(
                         throttled = 0
                         if payload:
                             await store.store_native_price(current_chain, token, payload, "api")
+                        else:
+                            # allow_404 -> None. Record it, or this token is re-asked on
+                            # every sweep for the life of the deployment.
+                            await store.store_native_price_miss(current_chain, token)
 
                 group.create_task(_resilient_loop("rpc", chain, scan_action, 12.0))
                 group.create_task(_resilient_loop("competition", chain, competition_action, 30.0))
