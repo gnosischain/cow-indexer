@@ -77,7 +77,7 @@ class CowApiClient:
             headers = {"X-API-Key": api_key} if api_key else None
             transport = CurlTransport(headers=headers)
         self.transport = transport
-        # A shared limiter lets multiple chains share one api.cow.fi rate budget
+        # A shared limiter lets multiple chains share one CoW gateway rate budget
         # (they hit the same host/key); otherwise each chain limits independently.
         self.limiter = limiter or AsyncRateLimiter(interval_seconds, max_interval_seconds)
         self.max_attempts = max_attempts

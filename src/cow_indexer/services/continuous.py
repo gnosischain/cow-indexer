@@ -89,7 +89,7 @@ async def run_continuous(
     await server.start()
     clients: list[tuple[RpcClient, CowApiClient]] = []
     # One limiter shared by every chain: all CoW API calls target the same
-    # api.cow.fi host/key, so the rate budget must be global. Otherwise N chains
+    # CoW gateway host/key, so the rate budget must be global. Otherwise N chains
     # run at N x the per-chain rate and blow past the key's allowance.
     api_limiter = AsyncRateLimiter(runtime.api_interval_seconds, runtime.api_max_interval_seconds)
     try:

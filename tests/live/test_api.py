@@ -9,7 +9,7 @@ pytestmark = pytest.mark.skipif(os.getenv("COW_RUN_LIVE") != "1", reason="set CO
 
 @pytest.mark.asyncio
 async def test_mainnet_api_version() -> None:
-    client = CowApiClient("https://api.cow.fi/mainnet", "mainnet")
+    client = CowApiClient("https://partners.cow.fi/mainnet", "mainnet")
     try:
         assert await client.version()
     finally:
