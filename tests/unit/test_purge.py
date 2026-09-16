@@ -170,3 +170,31 @@ def test_final_settings_defaults() -> None:
     assert store._purge_settings["max_threads"] == 2
     assert store._purge_settings["lightweight_deletes_sync"] == 2
     assert store._purge_settings["max_rows_in_set"] == 50_000
+
+
+@pytest.mark.asyncio
+async def test_live_lane_leases_newest_first_backfill_oldest_first() -> None:
+    """The live lane must track the tip; the backfill drain must not.
+
+    Ordering the live lane ascending put newly discovered orders behind every older
+    queued item. Measured 2026-09-16: 278K pending whose oldest dated to 09-09 kept
+    orders.creation_date frozen for ten hours on six chains while completions ran at
+    ~31/min -- the tip was six days of queue away. History belongs to
+    backfill-orderbook, which has its own kinds, client and limiter.
+    """
+    from cow_indexer.models import BACKFILL_WORK_KINDS
+
+    config = load_config(ROOT / "config" / "chains.yaml")
+    chain = config.select("sepolia")[0]
+
+    client = _FakeClient(query_rows=[[], []])
+    store = ClickHouseStore(ClickHouseConfig(host="h", user="u", password="p", database="cow_db"), ROOT)
+    store.client = client
+
+    await store.lease_work(chain, "w", 10)
+    live_sql = client.queries[-1][0]
+    assert "ORDER BY next_attempt_at DESC" in live_sql, "live lane must be newest-first"
+
+    await store.lease_work(chain, "w", 10, kinds=BACKFILL_WORK_KINDS)
+    backfill_sql = client.queries[-1][0]
+    assert "ORDER BY next_attempt_at ASC" in backfill_sql, "backfill stays oldest-first"

@@ -870,6 +870,20 @@ class ClickHouseStore:
         else:
             kind_clause = "AND kind IN {kinds:Array(String)} "
             kind_parameters = {"kinds": list(kinds)}
+        # NEWEST FIRST on the live path, oldest first for the backfill drain.
+        #
+        # The live lane's job is to track the tip, not to drain history -- history is
+        # what `backfill-orderbook` is for, on its own kinds, its own client and its own
+        # rate limiter. Ordering the live lane ascending made new orders queue BEHIND
+        # every older item: on 2026-09-16, with 278K pending whose oldest dated to
+        # 09-09, orders.creation_date on six chains stayed frozen for ten hours while
+        # completions ran at ~31/min -- at that rate the tip was six days away. Raising
+        # throughput could never fix that; only the ordering can.
+        #
+        # Old live items are not stranded: seed-orders anti-joins traded uids against
+        # `orders` and re-enqueues whatever is genuinely missing onto the backfill lane,
+        # which drains far faster than the live loop ever could.
+        order_clause = "ORDER BY next_attempt_at " + ("ASC " if kinds else "DESC ")
         async with self._final_gate():
             result = await self.client.query(
                 f"SELECT work_id, kind, key, payload, attempts "
@@ -878,7 +892,7 @@ class ClickHouseStore:
                 f"{kind_clause}"
                 "AND ((status = 'pending' AND next_attempt_at <= now64(3)) "
                 "OR (status = 'running' AND lease_until < now64(3))) "
-                "ORDER BY next_attempt_at LIMIT {limit:UInt32}",
+                f"{order_clause}LIMIT {{limit:UInt32}}",
                 parameters={
                     "environment": chain.environment,
                     "chain_id": chain.chain_id,
