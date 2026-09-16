@@ -7,7 +7,7 @@ from datetime import timedelta
 import structlog
 
 from cow_indexer.config import ChainConfig, RuntimeConfig
-from cow_indexer.observability import HealthServer
+from cow_indexer.observability import PURGE_SWEEPS, WORK_ITEMS_PURGED, HealthServer
 from cow_indexer.services.enrichment import EnrichmentService
 from cow_indexer.services.historical import HistoricalIndexer
 from cow_indexer.sources.cow_api import AsyncRateLimiter, CowApiClient, CowApiError
@@ -66,13 +66,19 @@ async def _purge_loop(
             cutoff = utcnow() - timedelta(hours=runtime.purge_grace_hours)
             purged = 0
             for chain in chains:
-                purged += await store.purge_finished_work(chain, cutoff, runtime.purge_batch)
+                deleted = await store.purge_finished_work(chain, cutoff, runtime.purge_batch)
+                WORK_ITEMS_PURGED.labels(chain.key).inc(deleted)
+                purged += deleted
             failures = 0
+            PURGE_SWEEPS.labels("ok").inc()
             log.info("purge_sweep", purged=purged, chains=len(chains))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             failures += 1
+            # Counted as well as logged: see observability.PURGE_SWEEPS for why the
+            # error log alone was not enough to notice retention had stopped.
+            PURGE_SWEEPS.labels("error").inc()
             log.error(
                 "purge_error", failures=failures, error=f"{type(exc).__name__}: {exc}"
             )

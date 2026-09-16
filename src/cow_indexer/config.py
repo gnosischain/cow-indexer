@@ -145,6 +145,12 @@ class RuntimeConfig(BaseModel):
     # DB load. Throughput is ultimately bounded by the global API rate limiter anyway.
     enrich_batch: int = 200
     enrich_interval_seconds: float = 10.0
+    # Wall-clock ceiling on ONE run_once batch. Below the 5-minute lease TTL in
+    # lease_work, so an abandoned batch is always released (release_work) before
+    # its lease could lapse and hand the same items to a second worker. Without a
+    # ceiling a few slow items hold the gather for many minutes and that chain
+    # cannot lease again -- the stall mode seen on 2026-09-16.
+    enrich_batch_timeout_seconds: float = 120.0
     # Scheduled retention of terminal work_items so the queue stays small and the
     # lease_work FINAL never scans an unbounded table. Disable during a one-time
     # backlog cleanup (run the `purge-work` CLI instead) so the two don't overlap.
@@ -187,6 +193,9 @@ class RuntimeConfig(BaseModel):
             api_key=api_key,
             enrich_batch=int(os.getenv("COW_ENRICH_BATCH", "200")),
             enrich_interval_seconds=float(os.getenv("COW_ENRICH_INTERVAL_SECONDS", "10")),
+            enrich_batch_timeout_seconds=float(
+                os.getenv("COW_ENRICH_BATCH_TIMEOUT_SECONDS", "120")
+            ),
             purge_enabled=os.getenv("COW_PURGE_ENABLED", "true").lower() in {"1", "true", "yes"},
             purge_interval_seconds=float(os.getenv("COW_PURGE_INTERVAL_SECONDS", "900")),
             purge_grace_hours=float(os.getenv("COW_PURGE_GRACE_HOURS", "24")),

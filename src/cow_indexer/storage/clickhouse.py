@@ -10,6 +10,7 @@ from typing import Any
 import clickhouse_connect
 import structlog
 from clickhouse_connect.driver import httputil
+from clickhouse_connect.driver.exceptions import DatabaseError
 
 from cow_indexer.config import ChainConfig, ClickHouseConfig
 from cow_indexer.models import (
@@ -64,6 +65,18 @@ PURGE_DELETE_SETTINGS = {
     "lightweight_deletes_sync": 2,
 }
 
+# work_ids inlined per retention DELETE. The statement text — not `purge_batch` — is
+# what ClickHouse has to accept: clickhouse-connect POSTs the SQL as the request body
+# (driver/httpclient.py command: `payload = cmd`), and the server checks it against
+# max_query_size, which defaults to 256 KiB. Each id costs 67 bytes (64 hex chars plus
+# the "','" separator), so 3_000 ids is ~196 KiB, leaving headroom for the statement
+# prefix and a long quoted database name. Chunking here — rather than capping
+# `purge_batch` — keeps the batch a pure drain-rate knob: raising it buys more
+# statements per sweep, never a statement the server refuses to parse. Inlining 50_000
+# ids built one ~3.35 MB statement that ClickHouse rejected outright ("Max query size
+# exceeded", code 62), so every sweep deleted nothing and retention was silently off.
+PURGE_DELETE_CHUNK = 3_000
+
 # Decode the validTo embedded in an order uid, in SQL. A uid is '0x' + 112 hex chars
 # (56 bytes: 32 order digest + 20 owner + 4 big-endian validTo). The validTo hex is
 # bytes 52..56 = payload hex chars 105..112 (1-based) = full-string chars 107..114,
@@ -105,6 +118,24 @@ def _competition_tx_hashes(payload: dict[str, Any]) -> list[str]:
         if normalized not in hashes:
             hashes.append(normalized)
     return hashes
+
+
+# clickhouse-connect sends an insert as a ONE-SHOT body generator whose first chunk
+# carries the `INSERT INTO ... FORMAT Native` statement itself (driver/transform.py
+# build_insert) — unlike a query, whose SQL is re-sendable bytes. When the server drops
+# an expired keep-alive connection mid-request, HttpClient._raw_request retries once
+# with that SAME, now-exhausted generator (`if attempts == 1: continue`), so attempt 2
+# POSTs an empty body and ClickHouse answers `Empty query` (code 62). Neither attempt
+# wrote anything, so re-issuing the insert — which builds a fresh generator — is the
+# correct recovery. We never send an empty statement ourselves (_insert guards on
+# `rows`, split_sql drops blank statements, purge_finished_work guards on `work_ids`),
+# so this fingerprint can only be the burned generator.
+INSERT_ATTEMPTS = 3
+
+
+def _is_burned_insert_body(exc: Exception) -> bool:
+    message = str(exc)
+    return "code: 62" in message and "Empty query" in message
 
 
 class ClickHouseStore:
@@ -212,7 +243,24 @@ class ClickHouseStore:
         await self._ensure()
         columns = list(rows[0])
         data = [[row[column] for column in columns] for row in rows]
-        await self.client.insert(f"{self.database}.{table}", data, column_names=columns)
+        for attempt in range(1, INSERT_ATTEMPTS + 1):
+            try:
+                await self.client.insert(
+                    f"{self.database}.{table}", data, column_names=columns
+                )
+                break
+            except DatabaseError as exc:
+                # See _is_burned_insert_body: the driver ate our request body retrying a
+                # reset keep-alive connection. Nothing was written; send it again.
+                if attempt == INSERT_ATTEMPTS or not _is_burned_insert_body(exc):
+                    raise
+                log.warning(
+                    "clickhouse_insert_body_retry",
+                    table=table,
+                    rows=len(rows),
+                    attempt=attempt,
+                )
+                await asyncio.sleep(0.25 * attempt)
         chain = str(rows[0].get("chain_id", "none"))
         ROWS_WRITTEN.labels(chain, table).inc(len(rows))
 
@@ -875,6 +923,45 @@ class ClickHouseStore:
         await self._insert("work_items", versions)
         return items
 
+    async def release_work(self, items: list[WorkItem]) -> None:
+        """Return leased-but-unworked items to `pending` WITHOUT charging an attempt.
+
+        lease_work increments `attempts` for every item it hands out, so an abandoned
+        batch would otherwise burn the retry budget of items nothing ever touched: six
+        abandonments (~30 min at a 5-minute lease) would dead-letter them at
+        MAX_REVISION-1, where a re-seed at revision 0 can never resurrect them. Simply
+        letting the lease lapse has the same cost, so the caller must release explicitly.
+
+        The written row carries the PRE-lease attempt count, and a revision of
+        `attempts * 10 + 2` so it supersedes that attempt's `running` row
+        (`attempts * 10 + 1`) while still losing to any real terminal outcome.
+        """
+        if not items:
+            return
+        now = utcnow()
+        await self._insert(
+            "work_items",
+            [
+                {
+                    "work_id": item.work_id,
+                    "environment": item.environment,
+                    "chain_id": item.chain_id,
+                    "kind": item.kind,
+                    "key": item.key,
+                    "payload": canonical_json(item.payload),
+                    "status": "pending",
+                    "attempts": max(item.attempts - 1, 0),
+                    "lease_owner": "",
+                    "lease_until": None,
+                    "next_attempt_at": now,
+                    "error": "",
+                    "revision": item.attempts * 10 + 2,
+                    "observed_at": now,
+                }
+                for item in items
+            ],
+        )
+
     async def finish_work(
         self,
         item: WorkItem,
@@ -1028,8 +1115,9 @@ class ClickHouseStore:
         """Delete every version of terminal (done/dead/unavailable) work items whose
         latest write predates `cutoff`, keeping `work_items` small so `lease_work FINAL`
         never scans an unbounded table. Bounded and FINAL-free: select at most `batch`
-        aged terminal work_ids, then delete all their versions. Returns the number of
-        work_ids purged so the caller can decide whether another batch is due.
+        aged terminal work_ids, then delete all their versions in PURGE_DELETE_CHUNK-sized
+        statements. Returns the number of work_ids purged so the caller can decide whether
+        another batch is due.
 
         This is finite-window deduplication, NOT permanent completion: after a work_id
         is purged, a later deterministic rediscovery (finality rescan, latest
@@ -1057,16 +1145,20 @@ class ClickHouseStore:
         work_ids = [row[0] for row in selected.result_rows]
         if not work_ids:
             return 0
-        # work_id is a sha256 hex digest (see enqueue_work_many), so inlining the list
-        # is injection-safe and avoids a huge server-side array parameter.
-        id_list = "','".join(work_ids)
-        await self.client.command(
-            f"DELETE FROM {self.quoted_database}.work_items "
-            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
-            f"AND work_id IN ('{id_list}')",
-            parameters={"environment": chain.environment, "chain_id": chain.chain_id},
-            settings=self._purge_settings,
-        )
+        # work_id is a sha256 hex digest (see enqueue_work_many), so inlining the list is
+        # injection-safe and avoids a huge server-side array parameter — which would not
+        # help anyway: clickhouse-connect binds {ids:Array(String)} as a `param_ids` URL
+        # parameter (driver/binding.py bind_query), trading max_query_size for the
+        # tighter http_max_uri_size. Inlining stays, bounded per statement instead.
+        for start in range(0, len(work_ids), PURGE_DELETE_CHUNK):
+            id_list = "','".join(work_ids[start : start + PURGE_DELETE_CHUNK])
+            await self.client.command(
+                f"DELETE FROM {self.quoted_database}.work_items "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                f"AND work_id IN ('{id_list}')",
+                parameters={"environment": chain.environment, "chain_id": chain.chain_id},
+                settings=self._purge_settings,
+            )
         return len(work_ids)
 
     async def import_rows(

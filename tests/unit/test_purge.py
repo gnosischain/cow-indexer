@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from cow_indexer.config import ClickHouseConfig, load_config
-from cow_indexer.storage.clickhouse import ClickHouseStore
+from cow_indexer.storage.clickhouse import PURGE_DELETE_CHUNK, ClickHouseStore
 
 ROOT = Path(__file__).parents[2]
 
@@ -67,6 +67,59 @@ async def test_purge_selects_bounded_then_deletes_all_versions() -> None:
     assert "('id1','id2')" in delete_sql
     assert delete_settings == store._purge_settings
     assert delete_settings["lightweight_deletes_sync"] == 2
+
+
+# ClickHouse's default max_query_size. The retention DELETE is POSTed as the request
+# body and parsed under this limit, so it is the bound every statement must respect.
+MAX_QUERY_SIZE = 256 * 1024
+
+
+@pytest.mark.asyncio
+async def test_purge_delete_statements_fit_max_query_size() -> None:
+    """A full 50_000-id batch inlined into one DELETE is ~3.35 MB, which ClickHouse
+    rejects with `Max query size exceeded` (code 62) — deleting nothing, every sweep,
+    silently. The ids must be chunked so no statement can exceed the server's limit
+    however large `batch` is."""
+    work_ids = [f"{index:064x}" for index in range(50_000)]
+    fake = _FakeClient(query_rows=[[[work_id] for work_id in work_ids]])
+    store = _store(fake)
+
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    purged = await store.purge_finished_work(_chain(), cutoff, batch=50_000)
+
+    # The caller still sees one batch of work — chunking is an implementation detail,
+    # and the CLI drain loop terminates on `purged < batch`.
+    assert purged == 50_000
+    # Assertions compare scalars, never the statements themselves: a regression here
+    # makes these multi-MB, and pytest rendering that diff is its own kind of hang.
+    assert max(len(sql.encode()) for sql, _, _ in fake.commands) < MAX_QUERY_SIZE
+    assert all(settings == store._purge_settings for _, _, settings in fake.commands)
+    # Chunks are full except the last, which pins the slice arithmetic.
+    full, remainder = divmod(50_000, PURGE_DELETE_CHUNK)
+    assert [sql.count("','") + 1 for sql, _, _ in fake.commands] == (
+        [PURGE_DELETE_CHUNK] * full + ([remainder] if remainder else [])
+    )
+    # Every selected work_id is deleted exactly once, across all chunks.
+    deleted = [
+        work_id
+        for delete_sql, _, _ in fake.commands
+        for work_id in delete_sql.split("IN ('")[1].rstrip("')").split("','")
+    ]
+    assert len(deleted) == len(work_ids)
+    assert len(set(deleted) ^ set(work_ids)) == 0
+
+
+@pytest.mark.asyncio
+async def test_purge_uses_one_statement_below_the_chunk_size() -> None:
+    """Chunking must not fragment an ordinary sweep into extra mutations."""
+    work_ids = [f"{index:064x}" for index in range(PURGE_DELETE_CHUNK)]
+    fake = _FakeClient(query_rows=[[[work_id] for work_id in work_ids]])
+    store = _store(fake)
+
+    await store.purge_finished_work(_chain(), datetime(2026, 1, 1, tzinfo=UTC), 50_000)
+
+    assert len(fake.commands) == 1
+    assert len(fake.commands[0][0].encode()) < MAX_QUERY_SIZE
 
 
 @pytest.mark.asyncio

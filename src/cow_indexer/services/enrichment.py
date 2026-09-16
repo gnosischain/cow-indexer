@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -8,6 +9,12 @@ import structlog
 
 from cow_indexer.config import ChainConfig, RuntimeConfig
 from cow_indexer.models import WorkItem
+from cow_indexer.observability import (
+    ENRICH_BATCH_SECONDS,
+    ENRICH_BATCH_TIMEOUTS,
+    ENRICH_ITEMS,
+    ENRICH_PREFETCH_SECONDS,
+)
 from cow_indexer.sources.cow_api import CompetitionUnavailable, CowApiClient
 from cow_indexer.storage.base import Storage
 from cow_indexer.utils import normalize_auction_order, normalize_order_uid, utcnow
@@ -31,22 +38,92 @@ class EnrichmentService:
         self.concurrency = concurrency
 
     async def run_once(self, limit: int = 20) -> int:
+        """Lease and process one batch, under a wall-clock deadline.
+
+        The deadline is load-bearing, not defensive. `process()` makes SERIAL per-item
+        calls beyond the batched prefetch (iter_trades, get_order_status), each able to
+        hit the transport's 30s timeout and then `_request`'s six retries backing off to
+        30s -- so a handful of slow items could hold the gather for many minutes. The
+        caller (`enrich_action` via `_resilient_loop`) cannot lease again until this
+        returns, so one bad batch silently stalls that chain's whole live ingestion: the
+        loop keeps "running" without erroring and nothing in the metrics said so.
+        Measured 2026-09-16: 5-9 completions/min across 3-6 of 11 chains while 260K
+        items sat leaseable and every upstream component was healthy.
+
+        Unfinished items are released back to `pending` without charging an attempt --
+        see store.release_work for why letting the lease lapse is not good enough.
+        """
+        started = time.monotonic()
         items = await self.store.lease_work(self.chain, self.runtime.worker_id, limit)
         if not items:
+            ENRICH_BATCH_SECONDS.labels(self.chain.key).observe(time.monotonic() - started)
             return 0
+        ENRICH_ITEMS.labels(self.chain.key, "leased").inc(len(items))
+
         # Fetch the base orders for every leased order_uid item in one batched
         # request (get_orders_by_uids chunks at 128) instead of one call per item.
+        prefetch_started = time.monotonic()
         prefetched = await self._prefetch_orders(
             [item.key for item in items if item.kind == "order_uid"]
         )
+        ENRICH_PREFETCH_SECONDS.labels(self.chain.key).observe(
+            time.monotonic() - prefetch_started
+        )
+
         semaphore = asyncio.Semaphore(self.concurrency)
+        pending: set[str] = {item.work_id for item in items}
+        by_id = {item.work_id: item for item in items}
 
         async def guarded(item: WorkItem) -> None:
             async with semaphore:
                 await self._process_and_finish(item, prefetched)
+                # Only after the item reached a terminal write is it not our problem.
+                pending.discard(item.work_id)
 
-        await asyncio.gather(*(guarded(item) for item in items))
-        return len(items)
+        tasks = [asyncio.create_task(guarded(item)) for item in items]
+        timed_out = False
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=self.runtime.enrich_batch_timeout_seconds,
+            )
+        except TimeoutError:  # asyncio.TimeoutError is an alias on 3.11+
+            timed_out = True
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        elapsed = time.monotonic() - started
+        ENRICH_BATCH_SECONDS.labels(self.chain.key).observe(elapsed)
+        done = len(items) - len(pending)
+        ENRICH_ITEMS.labels(self.chain.key, "finished").inc(done)
+
+        if timed_out:
+            ENRICH_BATCH_TIMEOUTS.labels(self.chain.key).inc()
+            stranded = [by_id[work_id] for work_id in pending]
+            ENRICH_ITEMS.labels(self.chain.key, "released").inc(len(stranded))
+            await self.store.release_work(stranded)
+            log.warning(
+                "enrichment_batch_deadline",
+                chain=self.chain.key,
+                leased=len(items),
+                finished=done,
+                released=len(stranded),
+                seconds=round(elapsed, 1),
+            )
+        else:
+            # debug, not info: one line per chain per interval is ~66/min at 11 chains,
+            # and ENRICH_BATCH_SECONDS/ENRICH_ITEMS already carry the healthy path
+            # continuously. The deadline case above stays at warning because that is
+            # the condition nothing surfaced before.
+            log.debug(
+                "enrichment_batch",
+                chain=self.chain.key,
+                leased=len(items),
+                finished=done,
+                seconds=round(elapsed, 1),
+            )
+        return done
 
     async def _prefetch_orders(self, keys: list[str]) -> dict[str, dict[str, Any]] | None:
         """Batch-fetch base orders for leased order_uid items. Returns a uid->order

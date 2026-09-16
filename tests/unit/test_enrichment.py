@@ -29,6 +29,7 @@ class FakeStore:
         self._items = list(items)
         self.finished: list[tuple[str, bool, str | None]] = []
         self.stored_orders: list[str] = []
+        self.released: list[str] = []
 
     async def lease_work(self, chain, worker, limit):
         leased, self._items = self._items[:limit], self._items[limit:]
@@ -48,6 +49,9 @@ class FakeStore:
 
     async def enqueue_work(self, chain, kind, key, payload=None):
         pass
+
+    async def release_work(self, items):
+        self.released.extend(item.key for item in items)
 
 
 class FakeApi:
@@ -115,3 +119,47 @@ async def test_missing_order_in_batch_resolves_to_none() -> None:
     assert api.get_order_calls == []  # batch succeeded, so no per-item fallback
     assert store.stored_orders == [uid(1)]  # only the existing order is stored
     assert all(ok for _, ok, _ in store.finished)  # both still finish successfully
+
+
+@pytest.mark.asyncio
+async def test_slow_item_cannot_wedge_the_batch() -> None:
+    """A hanging item must not hold run_once past the deadline.
+
+    Regression for the 2026-09-16 live-ingestion stall: `process()` makes serial
+    per-item calls (iter_trades, get_order_status) that can each hit the transport's
+    30s timeout and then six retries backing off to 30s. With no ceiling, a few such
+    items held the gather for minutes, and because the caller cannot lease again until
+    run_once returns, that chain's ingestion stopped -- without raising, so
+    _resilient_loop never logged and nothing alerted.
+    """
+    import asyncio
+
+    class HangingApi(FakeApi):
+        async def get_order_status(self, key):
+            if key == uid(0):
+                await asyncio.sleep(30)  # never completes within the deadline
+            return {"status": "open"}
+
+    store = FakeStore([work("order_uid", uid(i)) for i in range(3)])
+    chain = load_config(ROOT / "config" / "chains.yaml").select("sepolia")[0]
+    runtime = RuntimeConfig(enrich_batch_timeout_seconds=0.25, enrich_concurrency=3)
+    svc = EnrichmentService(chain, HangingApi(), store, runtime)
+
+    started = asyncio.get_running_loop().time()
+    done = await svc.run_once(limit=10)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 5, "run_once must return at the deadline, not wait for the hang"
+    assert done == 2, "the two healthy items still completed"
+    assert store.released == [uid(0)], "the stranded item is released, not abandoned"
+    # Released, not finished: finish_work would record the burned attempt and six such
+    # rounds would dead-letter an item nothing ever actually processed.
+    assert uid(0) not in [key for key, _, _ in store.finished]
+
+
+@pytest.mark.asyncio
+async def test_healthy_batch_reports_no_release() -> None:
+    store = FakeStore([work("order_uid", uid(i)) for i in range(3)])
+    done = await service(store, FakeApi()).run_once(limit=10)
+    assert done == 3
+    assert store.released == []
