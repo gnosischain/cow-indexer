@@ -240,3 +240,31 @@ async def test_bulk_inserts_do_not_wait_for_flush_but_ledgers_do() -> None:
     store2.client = client2
     await store2._insert("orders", [row])
     assert dict(client2.calls)["cow_db.orders"] is None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_is_async_ack_but_lease_and_finish_stay_durable() -> None:
+    """Classify by WRITE: an enqueue (revision-0 pending, rediscoverable if lost) acks at
+    the async buffer even though work_items is a ledger; lease/finish/release stay durable."""
+    from cow_indexer.models import WorkItem
+
+    class _InsertClient(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+        async def insert(self, table, data, column_names=None, settings=None):
+            self.calls.append((table, settings))
+
+    chain = load_config(ROOT / "config" / "chains.yaml").select("sepolia")[0]
+    store = ClickHouseStore(ClickHouseConfig(host="h", user="u", password="p", database="cow_db"), ROOT)
+    client = _InsertClient()
+    store.client = client
+
+    await store.enqueue_work_many(chain, [("order_uid", "0x" + "ab" * 56, None)])
+    assert client.calls[-1] == ("cow_db.work_items", {"wait_for_async_insert": 0})
+
+    item = WorkItem(work_id="w", environment="production", chain_id=chain.chain_id, kind="order_uid", key="k", attempts=1)
+    await store.finish_work(item, True)
+    assert client.calls[-1] == ("cow_db.work_items", None), "finish must be durable"
+    await store.release_work([item])
+    assert client.calls[-1] == ("cow_db.work_items", None), "release must be durable"

@@ -30,6 +30,7 @@ class FakeStore:
         self.finished: list[tuple[str, bool, str | None]] = []
         self.stored_orders: list[str] = []
         self.released: list[str] = []
+        self.enqueued_batches: list[list] = []
 
     async def lease_work(self, chain, worker, limit):
         leased, self._items = self._items[:limit], self._items[limit:]
@@ -49,6 +50,9 @@ class FakeStore:
 
     async def enqueue_work(self, chain, kind, key, payload=None):
         pass
+
+    async def enqueue_work_many(self, chain, items):
+        self.enqueued_batches.append(list(items))
 
     async def release_work(self, items):
         self.released.extend(item.key for item in items)
@@ -225,3 +229,14 @@ async def test_token_hit_is_not_recorded_as_a_miss() -> None:
     await service(store, PricedApi()).run_once(limit=10)
     assert store.prices == [token]
     assert store.price_misses == []
+
+
+@pytest.mark.asyncio
+async def test_fanout_is_one_insert_per_order() -> None:
+    """Five 1-row work_items inserts per order were ~70% of all insert calls (2026-09-17);
+    the fanout must enqueue everything for an order in ONE enqueue_work_many call."""
+    store = FakeStore([work("order_uid", uid(1))])
+    await service(store, FakeApi()).run_once(limit=10)
+    assert len(store.enqueued_batches) == 1, store.enqueued_batches
+    kinds = sorted(k for k, _, _ in store.enqueued_batches[0])
+    assert kinds == ["order_uid", "owner"], kinds  # FakeApi orders carry uid+owner only

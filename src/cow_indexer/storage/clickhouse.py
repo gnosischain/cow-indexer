@@ -245,7 +245,15 @@ class ClickHouseStore:
             self._final_semaphore = asyncio.Semaphore(MAX_CONCURRENT_FINAL)
         return self._final_semaphore
 
-    async def _insert(self, table: str, rows: list[dict[str, Any]]) -> None:
+    async def _insert(
+        self, table: str, rows: list[dict[str, Any]], *, durable: bool | None = None
+    ) -> None:
+        """`durable` classifies the WRITE, not the table. None -> the table allowlist
+        (SYNC_INSERT_TABLES). False -> ack at the async buffer even for a ledger table:
+        used ONLY for enqueue_work_many, whose rows are revision-0 `pending` items that
+        rediscovery re-creates if lost (see purge_finished_work's contract) -- and which
+        were 70% of all insert calls on 2026-09-17, so the table-level split alone moved
+        the per-call mean only 7.46s -> 5.28s. Lease/finish/release stay durable."""
         if not rows:
             return
         await self._ensure()
@@ -262,10 +270,9 @@ class ClickHouseStore:
         # runs async_insert=1 with a 1000ms busy timeout; with wait_for_async_insert=1
         # every call blocked for that timer PLUS the durable object-storage flush --
         # measured ~7s each, ~46 per enrichment item, i.e. ~98% of an item's cost.
+        sync = durable if durable is not None else table in SYNC_INSERT_TABLES
         settings = (
-            None
-            if table in SYNC_INSERT_TABLES or self.config.async_insert_wait
-            else {"wait_for_async_insert": 0}
+            None if sync or self.config.async_insert_wait else {"wait_for_async_insert": 0}
         )
         with REQUEST_LATENCY.labels("clickhouse", chain).time():
             for attempt in range(1, INSERT_ATTEMPTS + 1):
@@ -499,7 +506,8 @@ class ClickHouseStore:
                 "revision": 0,
                 "observed_at": now,
             }
-        await self._insert("work_items", list(rows.values()))
+        # Loss-safe by contract: a missing pending row is rediscovered, not lost.
+        await self._insert("work_items", list(rows.values()), durable=False)
 
     async def checkpoint(self, chain: ChainConfig, block: BlockHeader) -> None:
         current = await self.get_checkpoint(chain)

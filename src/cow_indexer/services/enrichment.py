@@ -247,22 +247,31 @@ class EnrichmentService:
             raise ValueError(f"unsupported work kind: {item.kind}")
 
     async def _fanout_order(self, order: dict[str, Any], include_owner: bool = True) -> None:
+        # ONE insert for the whole fanout, not one per item: five 1-row work_items
+        # inserts per order were most of an item's synchronous write cost.
+        items: list[tuple[str, str, dict[str, Any] | None]] = []
         if uid := order.get("uid"):
-            await self.store.enqueue_work(self.chain, "order_uid", uid)
+            items.append(("order_uid", uid, None))
         if include_owner and (owner := order.get("owner")):
-            await self.store.enqueue_work(self.chain, "owner", owner)
+            items.append(("owner", owner, None))
         for key in ("sellToken", "buyToken"):
             if token := order.get(key):
-                await self.store.enqueue_work(self.chain, "token", token)
+                items.append(("token", token, None))
         app_data = order.get("appDataHash") or order.get("appData")
         if isinstance(app_data, str) and len(app_data) == 66:
-            await self.store.enqueue_work(self.chain, "app_data", app_data)
+            items.append(("app_data", app_data, None))
+        if items:
+            await self.store.enqueue_work_many(self.chain, items)
 
     async def _fanout_competition(self, payload: dict[str, Any]) -> None:
         auction = payload.get("auction") or {}
         # auction.orders may be bare UID strings or expanded order objects; normalize
         # both (order.get() on a str raises 'str' object has no attribute 'get').
-        for order in auction.get("orders", []):
-            normalized = normalize_auction_order(order)
-            if normalized:
-                await self.store.enqueue_work(self.chain, "order_uid", normalized[0])
+        # One insert per auction, not one per order: an auction carries hundreds.
+        items = [
+            ("order_uid", normalized[0], None)
+            for order in auction.get("orders", [])
+            if (normalized := normalize_auction_order(order))
+        ]
+        if items:
+            await self.store.enqueue_work_many(self.chain, items)
