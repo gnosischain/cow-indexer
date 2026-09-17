@@ -1,9 +1,10 @@
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from cow_indexer.config import ClickHouseConfig, load_config
+from cow_indexer.config import ClickHouseConfig, RuntimeConfig, load_config
 from cow_indexer.storage.clickhouse import PURGE_DELETE_CHUNK, ClickHouseStore
 
 ROOT = Path(__file__).parents[2]
@@ -293,3 +294,102 @@ async def test_purge_delete_carries_no_unsupported_setting() -> None:
     assert fake.commands, "no DELETE was issued"
     for _, _, settings in fake.commands:
         assert "lightweight_delete_mode" not in settings
+
+
+# --- recent-enqueue suppression -------------------------------------------------
+# The fan-out re-enqueues ids it already queued (an unfilled order reappears in ~95
+# successive auctions). Measured 2026-09-17: 83.8% of enqueue writes were for ids
+# already in work_items and changed nothing, and they were most of the pod's DB calls.
+
+
+class _ColumnRecordingClient(_FakeClient):
+    """_FakeClient records (table, data) only; the dedup tests need the column names to
+    read a written row back as a dict."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[tuple[str, list[dict]]] = []
+
+    async def insert(self, table, data, column_names=None, settings=None):
+        await super().insert(table, data, column_names=column_names, settings=settings)
+        self.writes.append(
+            (table, [dict(zip(column_names, row, strict=True)) for row in data])
+        )
+
+
+def _dedup_store(fake: _FakeClient, ttl: float = 900.0, cap: int = 250_000) -> ClickHouseStore:
+    config = ClickHouseConfig.from_env()
+    config.enqueue_dedup_ttl_seconds = ttl
+    config.enqueue_dedup_max_entries = cap
+    store = ClickHouseStore(config, ROOT)
+    store.client = fake
+    return store
+
+
+@pytest.mark.asyncio
+async def test_repeat_enqueue_is_written_once() -> None:
+    fake = _ColumnRecordingClient()
+    store = _dedup_store(fake)
+    chain = _chain()
+    for _ in range(5):
+        await store.enqueue_work_many(chain, [("order_uid", "0xabc", None)])
+    work_inserts = [rows for table, rows in fake.writes if table.endswith("work_items")]
+    assert len(work_inserts) == 1, "the same work_id was written more than once"
+    assert len(work_inserts[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_suppression_does_not_hide_new_work() -> None:
+    fake = _ColumnRecordingClient()
+    store = _dedup_store(fake)
+    chain = _chain()
+    await store.enqueue_work_many(chain, [("order_uid", "0xabc", None)])
+    await store.enqueue_work_many(
+        chain, [("order_uid", "0xabc", None), ("order_uid", "0xdef", None)]
+    )
+    written = [r["key"] for _, rows in fake.writes for r in rows]
+    assert written == ["0xabc", "0xdef"], written
+
+
+@pytest.mark.asyncio
+async def test_suppression_expires_so_rediscovery_still_works() -> None:
+    """Rediscovery is the only recovery for a dropped async enqueue and for a purged
+    item, so an id must become writable again once the TTL lapses."""
+    fake = _ColumnRecordingClient()
+    store = _dedup_store(fake, ttl=0.05)
+    chain = _chain()
+    await store.enqueue_work_many(chain, [("order_uid", "0xabc", None)])
+    await asyncio.sleep(0.08)
+    await store.enqueue_work_many(chain, [("order_uid", "0xabc", None)])
+    assert len([1 for table, _ in fake.writes if table.endswith("work_items")]) == 2
+
+
+@pytest.mark.asyncio
+async def test_dedup_ttl_stays_far_below_the_purge_grace() -> None:
+    """The suppression window must never outlive retention's grace, or a purged item
+    could be suppressed instead of rediscovered."""
+    ch = ClickHouseConfig()
+    assert ch.enqueue_dedup_ttl_seconds < RuntimeConfig().purge_grace_hours * 3600 / 10
+
+
+@pytest.mark.asyncio
+async def test_size_cap_evicts_and_only_costs_a_rewrite() -> None:
+    fake = _ColumnRecordingClient()
+    store = _dedup_store(fake, cap=2)
+    chain = _chain()
+    await store.enqueue_work_many(chain, [("order_uid", "0xaaa", None)])
+    await store.enqueue_work_many(chain, [("order_uid", "0xbbb", None)])
+    await store.enqueue_work_many(chain, [("order_uid", "0xccc", None)])  # evicts 0xaaa
+    await store.enqueue_work_many(chain, [("order_uid", "0xaaa", None)])  # written again
+    keys = [r["key"] for _, rows in fake.writes for r in rows]
+    assert keys == ["0xaaa", "0xbbb", "0xccc", "0xaaa"], keys
+
+
+@pytest.mark.asyncio
+async def test_suppression_can_be_disabled() -> None:
+    fake = _ColumnRecordingClient()
+    store = _dedup_store(fake, ttl=0)
+    chain = _chain()
+    for _ in range(3):
+        await store.enqueue_work_many(chain, [("order_uid", "0xabc", None)])
+    assert len([1 for table, _ in fake.writes if table.endswith("work_items")]) == 3

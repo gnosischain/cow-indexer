@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,7 +23,7 @@ from cow_indexer.models import (
     RpcLog,
     WorkItem,
 )
-from cow_indexer.observability import REQUEST_LATENCY, ROWS_WRITTEN
+from cow_indexer.observability import ENQUEUE_SUPPRESSED, REQUEST_LATENCY, ROWS_WRITTEN
 from cow_indexer.storage.migrations import migration_files, quote_database, split_sql
 from cow_indexer.utils import (
     canonical_json,
@@ -153,6 +155,55 @@ def _competition_tx_hashes(payload: dict[str, Any]) -> list[str]:
 # idempotent, re-derivable from its source, and safe to ack at the server buffer.
 SYNC_INSERT_TABLES = frozenset({"work_items", "indexing_checkpoints", "schema_migrations"})
 
+class _RecentEnqueues:
+    """Bounded, TTL'd set of work_ids this process enqueued recently.
+
+    Re-enqueueing an id that is already in work_items writes a revision-0 row that
+    changes nothing: ReplacingMergeTree keeps the highest revision, so the row either
+    loses to a terminal one or duplicates a pending one. Measured 2026-09-17 on the
+    live pod, 83.8% of enqueue writes were exactly that (43,975 rows across 26,661
+    distinct ids in 10 minutes, 22,342 of the ids already present), and those writes
+    were most of the ClickHouse call volume on a CPU-bound single core.
+
+    Dropping an entry is always safe -- it only means the row is written again -- so the
+    size cap evicts least-recently-seen first and the TTL simply lets an id through
+    again. Both directions of failure cost writes, never work.
+
+    The TTL is deliberately short relative to purge_grace_hours: rediscovery is what
+    recovers a lost async enqueue and what re-creates purged items, so suppression must
+    never outlive it. See ClickHouseConfig.enqueue_dedup_ttl_seconds.
+    """
+
+    def __init__(self, ttl_seconds: float, max_entries: int) -> None:
+        self.ttl = max(0.0, ttl_seconds)
+        self.max_entries = max(0, max_entries)
+        self._seen: OrderedDict[str, float] = OrderedDict()
+
+    @property
+    def enabled(self) -> bool:
+        return self.ttl > 0 and self.max_entries > 0
+
+    def take_new(self, work_ids: Sequence[str], now: float) -> list[str]:
+        """Return the ids that should be written, remembering them as it goes."""
+        if not self.enabled:
+            return list(work_ids)
+        fresh: list[str] = []
+        for work_id in work_ids:
+            expires_at = self._seen.get(work_id)
+            if expires_at is not None and expires_at > now:
+                # Still suppressed. Mark it recently used so the size cap does not evict
+                # a hot id, but do NOT extend its expiry: the TTL measures time since the
+                # last WRITE, so a constantly-recurring id is still rewritten every TTL.
+                self._seen.move_to_end(work_id)
+                continue
+            self._seen[work_id] = now + self.ttl
+            self._seen.move_to_end(work_id)
+            fresh.append(work_id)
+        while len(self._seen) > self.max_entries:
+            self._seen.popitem(last=False)
+        return fresh
+
+
 INSERT_ATTEMPTS = 3
 
 
@@ -168,6 +219,9 @@ class ClickHouseStore:
         self.database = config.database
         self.quoted_database = quote_database(config.database)
         self.client: Any = None
+        self._recent_enqueues = _RecentEnqueues(
+            config.enqueue_dedup_ttl_seconds, config.enqueue_dedup_max_entries
+        )
         # Process-wide gate limiting how many continuous-path FINAL reads run at once.
         # Created lazily inside the running loop so it binds to the correct event loop.
         self._final_semaphore: asyncio.Semaphore | None = None
@@ -521,8 +575,18 @@ class ClickHouseStore:
                 "revision": 0,
                 "observed_at": now,
             }
+        if not rows:
+            return
+        # Skip ids this process queued moments ago; see _RecentEnqueues for why that is
+        # a no-op at merge time and why the TTL must stay well under purge_grace_hours.
+        fresh = self._recent_enqueues.take_new(list(rows), time.monotonic())
+        suppressed = len(rows) - len(fresh)
+        if suppressed:
+            ENQUEUE_SUPPRESSED.labels(chain.key).inc(suppressed)
+        if not fresh:
+            return
         # Loss-safe by contract: a missing pending row is rediscovered, not lost.
-        await self._insert("work_items", list(rows.values()), durable=False)
+        await self._insert("work_items", [rows[work_id] for work_id in fresh], durable=False)
 
     async def checkpoint(self, chain: ChainConfig, block: BlockHeader) -> None:
         current = await self.get_checkpoint(chain)

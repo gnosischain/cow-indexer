@@ -118,6 +118,24 @@ class ClickHouseConfig(BaseModel):
     # -- ~319s of a ~324s item. Ledgers (work_items, indexing_checkpoints,
     # schema_migrations) always stay synchronous; see SYNC_INSERT_TABLES.
     async_insert_wait: bool = False
+    # Recent-enqueue suppression. The fan-out re-enqueues the same work_ids constantly
+    # (an unfilled order reappears in ~95 successive auctions); measured 2026-09-17,
+    # 83.8% of enqueue writes were for ids already in work_items and changed nothing.
+    # A bounded in-process set skips those writes.
+    #
+    # The TTL is a CORRECTNESS bound, not a tuning knob: two contracts depend on a
+    # re-enqueue eventually happening again. (1) enqueue inserts are async
+    # (durable=False), so a dropped revision-0 row is only recovered by rediscovery.
+    # (2) purge_finished_work deletes terminal items older than purge_grace_hours (24h
+    # by default) and relies on rediscovery to re-create anything still wanted. So the
+    # TTL must stay FAR below that grace -- 15 minutes leaves a >90x margin while still
+    # collapsing the auction re-enqueue storm. Set to 0 to disable suppression entirely.
+    enqueue_dedup_ttl_seconds: float = 900.0
+    # Memory bound. ~27K distinct ids are enqueued per 10 minutes, so a 15-minute window
+    # holds ~40K; 250K is ample headroom. When the cap is hit the least-recently-seen
+    # ids are dropped first, which only means they are written again -- never that work
+    # is lost.
+    enqueue_dedup_max_entries: int = 250_000
     final_query_memory_mb: int = 1024
     # Threads for those FINAL reads. Low, because FINAL peak memory scales with the
     # number of parts read in parallel, so fewer threads = lower peak.
@@ -137,6 +155,12 @@ class ClickHouseConfig(BaseModel):
             async_insert_wait=os.getenv("CLICKHOUSE_ASYNC_INSERT_WAIT", "0").lower()
             in {"1", "true", "yes"},
             final_query_threads=int(os.getenv("CLICKHOUSE_FINAL_MAX_THREADS", "2")),
+            enqueue_dedup_ttl_seconds=float(
+                os.getenv("CLICKHOUSE_ENQUEUE_DEDUP_TTL_SECONDS", "900")
+            ),
+            enqueue_dedup_max_entries=int(
+                os.getenv("CLICKHOUSE_ENQUEUE_DEDUP_MAX_ENTRIES", "250000")
+            ),
         )
 
 

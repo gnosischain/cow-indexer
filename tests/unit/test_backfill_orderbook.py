@@ -226,8 +226,14 @@ async def test_reseed_produces_identical_work_ids() -> None:
             self.inserts.append((table, data, column_names))
 
     client = _RecordingClient()
-    store = ClickHouseStore(ClickHouseConfig.from_env(), ROOT)
-    store.client = client  # bypass connect()
+    config = ClickHouseConfig.from_env()
+    # This test is about work_id DETERMINISM, so switch off the recent-enqueue
+    # suppression that would otherwise collapse the second write: what must be
+    # proven here is that both key orderings hash to the same id, not how many
+    # times the store chooses to write it.
+    config.enqueue_dedup_ttl_seconds = 0
+    store = ClickHouseStore(config, ROOT)
+    store.client = client  # bypass connect()  # bypass connect()
     chain = _chain()
 
     batch = [uid(2), uid(1), uid(3)]

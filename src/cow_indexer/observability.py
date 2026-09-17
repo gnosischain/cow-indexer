@@ -20,6 +20,17 @@ REQUEST_LATENCY = Histogram("cow_request_seconds", "External request latency", [
 # rate(cow_purge_sweeps_total{status="error"}[30m]) catches a raising sweep, and
 # increase(cow_work_items_purged_total[6h]) == 0 catches one that stops draining
 # without raising at all.
+# Enqueue suppression. The fan-out re-enqueues work_ids it has already queued: an
+# unfilled order reappears in ~95 successive auctions and is re-enqueued each time, and
+# measured 2026-09-17 83.8% of all enqueue writes were for ids that already existed.
+# Those rows add no work (ReplacingMergeTree keeps the highest revision) but they were
+# most of the pod's ClickHouse call volume. This counts what the in-process recent-set
+# suppressed, so the saving is visible and a cache that stops working is noticeable:
+# rate(cow_enqueue_suppressed_total[5m]) collapsing to 0 while throughput is unchanged
+# means the TTL or the size cap is wrong.
+ENQUEUE_SUPPRESSED = Counter(
+    "cow_enqueue_suppressed_total", "Enqueue writes skipped as recently queued", ["chain"]
+)
 PURGE_SWEEPS = Counter("cow_purge_sweeps_total", "Retention sweeps", ["status"])
 WORK_ITEMS_PURGED = Counter(
     "cow_work_items_purged_total", "Terminal work items deleted by retention", ["chain"]
