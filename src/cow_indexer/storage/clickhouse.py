@@ -130,6 +130,14 @@ def _competition_tx_hashes(payload: dict[str, Any]) -> list[str]:
 # correct recovery. We never send an empty statement ourselves (_insert guards on
 # `rows`, split_sql drops blank statements, purge_finished_work guards on `work_ids`),
 # so this fingerprint can only be the burned generator.
+# Tables whose rows are a correctness ledger, not bulk data: a write must be durable
+# before the caller continues. work_items is the lease/finish/release state machine;
+# indexing_checkpoints bounds the committed views (a checkpoint acked before its rows
+# were flushed would expose partially-written ranges); schema_migrations records what
+# ran. Everything else -- payloads, orders, events, auctions, prices, blocks -- is
+# idempotent, re-derivable from its source, and safe to ack at the server buffer.
+SYNC_INSERT_TABLES = frozenset({"work_items", "indexing_checkpoints", "schema_migrations"})
+
 INSERT_ATTEMPTS = 3
 
 
@@ -250,11 +258,21 @@ class ClickHouseStore:
         # inserts an order_uid item performs were the largest cost nothing measured, and
         # ClickHouse Cloud part-creation backpressure under ~176 concurrent writers is
         # invisible without this.
+        # Return on the server's async-insert buffer ack for bulk tables. Cloud already
+        # runs async_insert=1 with a 1000ms busy timeout; with wait_for_async_insert=1
+        # every call blocked for that timer PLUS the durable object-storage flush --
+        # measured ~7s each, ~46 per enrichment item, i.e. ~98% of an item's cost.
+        settings = (
+            None
+            if table in SYNC_INSERT_TABLES or self.config.async_insert_wait
+            else {"wait_for_async_insert": 0}
+        )
         with REQUEST_LATENCY.labels("clickhouse", chain).time():
             for attempt in range(1, INSERT_ATTEMPTS + 1):
                 try:
                     await self.client.insert(
-                        f"{self.database}.{table}", data, column_names=columns
+                        f"{self.database}.{table}", data, column_names=columns,
+                        settings=settings,
                     )
                     break
                 except DatabaseError as exc:

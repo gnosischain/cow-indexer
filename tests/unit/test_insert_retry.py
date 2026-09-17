@@ -32,7 +32,7 @@ class _FlakyClient:
         self._error = error or DatabaseError(EMPTY_QUERY_ERROR)
         self.inserts: list[tuple[str, list]] = []
 
-    async def insert(self, table, data, column_names=None):
+    async def insert(self, table, data, column_names=None, settings=None):
         if self._remaining > 0:
             self._remaining -= 1
             raise self._error

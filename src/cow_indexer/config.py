@@ -111,6 +111,13 @@ class ClickHouseConfig(BaseModel):
     # enough to read a large ReplacingMergeTree queue, small enough that one oversized
     # query fails in isolation instead of tripping the OvercommitTracker; paired with a
     # process-wide semaphore capping concurrent FINAL reads so the aggregate is bounded.
+    # Bulk data inserts return on the server's async-insert buffer ack instead of
+    # waiting for the durable flush (wait_for_async_insert=0). Measured 2026-09-17 on
+    # ClickHouse Cloud with async_insert already ON and a 1000ms busy timeout: every
+    # insert cost ~7s, uniform across chains, and an enrichment item made 46 of them
+    # -- ~319s of a ~324s item. Ledgers (work_items, indexing_checkpoints,
+    # schema_migrations) always stay synchronous; see SYNC_INSERT_TABLES.
+    async_insert_wait: bool = False
     final_query_memory_mb: int = 1024
     # Threads for those FINAL reads. Low, because FINAL peak memory scales with the
     # number of parts read in parallel, so fewer threads = lower peak.
@@ -127,6 +134,8 @@ class ClickHouseConfig(BaseModel):
             secure=os.getenv("CLICKHOUSE_SECURE", "false").lower() in {"1", "true", "yes"},
             pool_size=int(os.getenv("CLICKHOUSE_POOL_SIZE", "32")),
             final_query_memory_mb=int(os.getenv("CLICKHOUSE_FINAL_MEMORY_MB", "1024")),
+            async_insert_wait=os.getenv("CLICKHOUSE_ASYNC_INSERT_WAIT", "0").lower()
+            in {"1", "true", "yes"},
             final_query_threads=int(os.getenv("CLICKHOUSE_FINAL_MAX_THREADS", "2")),
         )
 

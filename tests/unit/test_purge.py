@@ -31,7 +31,7 @@ class _FakeClient:
     async def command(self, sql, parameters=None, settings=None):
         self.commands.append((sql, parameters, settings))
 
-    async def insert(self, table, data, column_names=None):
+    async def insert(self, table, data, column_names=None, settings=None):
         self.inserts.append((table, data))
 
 
@@ -198,3 +198,45 @@ async def test_live_lane_leases_newest_first_backfill_oldest_first() -> None:
     await store.lease_work(chain, "w", 10, kinds=BACKFILL_WORK_KINDS)
     backfill_sql = client.queries[-1][0]
     assert "ORDER BY next_attempt_at ASC" in backfill_sql, "backfill stays oldest-first"
+
+
+@pytest.mark.asyncio
+async def test_bulk_inserts_do_not_wait_for_flush_but_ledgers_do() -> None:
+    """wait_for_async_insert=0 for bulk data; ledgers stay synchronous.
+
+    Measured 2026-09-17 on ClickHouse Cloud (async_insert already on, 1000ms busy
+    timeout): every insert cost ~7s uniformly across chains because the client waited
+    for the durable flush, and an enrichment item made 46 of them -- ~319s of ~324s.
+    work_items is the lease state machine and indexing_checkpoints bounds the committed
+    views, so those must still return only after a durable write.
+    """
+    from cow_indexer.storage.clickhouse import SYNC_INSERT_TABLES
+
+    class _InsertClient(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+        async def insert(self, table, data, column_names=None, settings=None):
+            self.calls.append((table, settings))
+
+    store = ClickHouseStore(ClickHouseConfig(host="h", user="u", password="p", database="cow_db"), ROOT)
+    client = _InsertClient()
+    store.client = client
+    row = {"environment": "production", "chain_id": 1, "x": 1}
+    await store._insert("raw_api_payloads", [row])
+    await store._insert("orders", [row])
+    for ledger in sorted(SYNC_INSERT_TABLES):
+        await store._insert(ledger, [row])
+
+    by = dict(client.calls)
+    assert by["cow_db.raw_api_payloads"] == {"wait_for_async_insert": 0}
+    assert by["cow_db.orders"] == {"wait_for_async_insert": 0}
+    for ledger in SYNC_INSERT_TABLES:
+        assert by[f"cow_db.{ledger}"] is None, f"{ledger} must stay synchronous"
+
+    # The env/config kill switch restores full waiting everywhere without a rebuild.
+    store2 = ClickHouseStore(ClickHouseConfig(host="h", user="u", password="p", database="cow_db", async_insert_wait=True), ROOT)
+    client2 = _InsertClient()
+    store2.client = client2
+    await store2._insert("orders", [row])
+    assert dict(client2.calls)["cow_db.orders"] is None

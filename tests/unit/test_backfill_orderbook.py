@@ -222,7 +222,7 @@ async def test_reseed_produces_identical_work_ids() -> None:
         def __init__(self) -> None:
             self.inserts: list[tuple[str, list, list]] = []
 
-        async def insert(self, table, data, column_names=None):
+        async def insert(self, table, data, column_names=None, settings=None):
             self.inserts.append((table, data, column_names))
 
     client = _RecordingClient()
@@ -371,7 +371,7 @@ class _FakeQueryClient:
         self.stream_queries.append((sql, parameters))
         return _FakeStreamContext(self._stream_blocks)
 
-    async def insert(self, table, data, column_names=None):
+    async def insert(self, table, data, column_names=None, settings=None):
         self.inserts.append((table, data))
 
 
