@@ -30,35 +30,67 @@ class CompetitionUnavailable(RuntimeError):
 
 
 class AsyncRateLimiter:
-    """One request per ``interval_seconds``, adaptively backing off toward
-    ``max_interval_seconds`` when the upstream edge throttles us (429/403) and
-    recovering toward the base rate as requests succeed."""
+    """Paces requests to one per ``interval_seconds`` across every caller sharing it,
+    adaptively backing off toward ``max_interval_seconds`` when the upstream edge
+    throttles us (429/403) and recovering toward the base rate as requests succeed.
+
+    Slot reservation, not a held lock. Each caller takes the lock only long enough
+    to reserve the next free time slot (microseconds) and then sleeps OUTSIDE the
+    lock until its own slot. The previous design slept while holding the lock, so
+    the N-th of N contenders waited for N-1 full sleeps -- and every sleep overshoot
+    on a busy event loop (176 coroutines at 16 workers x 11 chains) was added to
+    everyone behind it. Measured on 2026-09-17: 9.5-10.3s per acquisition at only
+    ~4.5 req/s of a 10 req/s budget, and 76% of the per-item enrichment cost.
+    With reservation the wait is exactly the caller's queue position x interval and
+    an overshoot delays only the coroutine that overshot.
+
+    ``slow_down`` bumps an epoch so slots reserved at the old, faster spacing are
+    re-reserved at the new one: a throttle still takes effect on the very next
+    admission, as it did when the interval was read under the lock.
+    """
 
     def __init__(self, interval_seconds: float, max_interval_seconds: float = 5.0) -> None:
         self.base_interval = interval_seconds
         self.max_interval = max(max_interval_seconds, interval_seconds)
         self.interval_seconds = interval_seconds
         self._lock = asyncio.Lock()
-        self._next = 0.0
+        self._next = 0.0  # earliest free slot, in loop.time() seconds
+        self._epoch = 0  # incremented by slow_down; invalidates outstanding reservations
+
+    def _reserve(self, now: float) -> float:
+        slot = max(now, self._next)
+        self._next = slot + self.interval_seconds
+        return slot
 
     async def wait(self) -> None:
-        # Timed under source="limiter": this lock is shared by every worker on every chain
-        # and is held WHILE sleeping, so with N waiters each call queues behind N-1 others.
-        # At 16 workers x 11 chains that is ~176 contenders; queueing here is the prime
-        # suspect for the ~212s/item gap measured on 2026-09-17, and the transport-only
-        # "api" timing cannot see it.
+        # Timed under source="limiter" so the queueing cost stays visible separately
+        # from the transport-only "api" timing.
         loop = asyncio.get_running_loop()
         with REQUEST_LATENCY.labels("limiter", "all").time():
-            async with self._lock:
-                delay = self._next - loop.time()
+            while True:
+                async with self._lock:
+                    epoch = self._epoch
+                    slot = self._reserve(loop.time())
+                delay = slot - loop.time()
                 if delay > 0:
                     await asyncio.sleep(delay)
-                self._next = loop.time() + self.interval_seconds
+                if epoch == self._epoch:
+                    return
+                # The rate was cut while we slept on a reservation made at the old
+                # spacing; take a fresh slot at the new spacing instead of admitting.
 
     def slow_down(self, factor: float = 2.0) -> None:
         self.interval_seconds = min(
             self.max_interval, max(self.base_interval, self.interval_seconds * factor)
         )
+        self._epoch += 1
+        # Nothing reserved before now may be admitted before one new interval has
+        # elapsed; waiters re-reserve behind this point.
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:  # called outside a running loop (unit tests)
+            return
+        self._next = max(self._next, now + self.interval_seconds)
 
     def speed_up(self, factor: float = 0.9) -> None:
         self.interval_seconds = max(self.base_interval, self.interval_seconds * factor)

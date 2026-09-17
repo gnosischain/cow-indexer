@@ -124,3 +124,73 @@ async def test_403_is_retried_and_throttles(monkeypatch) -> None:
     assert result == {"ok": True}
     assert transport.calls == 2  # 403 was retried, not raised
     assert client.limiter.interval_seconds > base  # and it slowed the global rate
+
+
+@pytest.mark.asyncio
+async def test_limiter_sleeps_outside_the_lock(monkeypatch) -> None:
+    """N contenders must finish in ~N x interval, not N x (interval + overshoot).
+
+    Every asyncio.sleep is made to overshoot by 20ms, the way a busy event loop does.
+    With the sleep held under the lock (the old design) 30 waiters at a 1ms interval
+    serialize into 30 x 21ms = 630ms; with slot reservation the overshoots overlap
+    and the whole group is admitted in ~30ms + one overshoot.
+    """
+    real_sleep = asyncio.sleep
+
+    async def overshooting_sleep(delay):
+        await real_sleep(delay + 0.02)
+
+    monkeypatch.setattr(asyncio, "sleep", overshooting_sleep)
+    limiter = AsyncRateLimiter(0.001)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.gather(*(limiter.wait() for _ in range(30)))
+    elapsed = loop.time() - started
+    assert elapsed < 0.25, f"waiters serialized behind each other's sleeps: {elapsed:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_limiter_admissions_are_spaced_by_the_interval() -> None:
+    limiter = AsyncRateLimiter(0.005)
+    loop = asyncio.get_running_loop()
+    admitted: list[float] = []
+
+    async def one():
+        await limiter.wait()
+        admitted.append(loop.time())
+
+    started = loop.time()
+    await asyncio.gather(*(one() for _ in range(8)))
+    admitted.sort()
+    # The k-th slot is reserved at >= started + k * interval and a sleep can only wake
+    # late, never early -- so no admission may run ahead of its slot. (Consecutive
+    # wake-up gaps are NOT a valid check: an early waiter waking late shrinks them.)
+    for k, at in enumerate(admitted):
+        assert at >= started + k * 0.005 - 0.0002, (k, at - started)
+
+
+@pytest.mark.asyncio
+async def test_throttle_respaces_outstanding_reservations() -> None:
+    """A slow_down while waiters hold fast reservations must still bite immediately."""
+    limiter = AsyncRateLimiter(0.001, max_interval_seconds=0.05)
+    loop = asyncio.get_running_loop()
+    admitted: list[float] = []
+
+    async def one():
+        await limiter.wait()
+        admitted.append(loop.time())
+
+    # Reserve 20 slots at 1ms spacing, then cut the rate to 32ms before most admit.
+    tasks = [asyncio.create_task(one()) for _ in range(20)]
+    await asyncio.sleep(0)
+    for _ in range(5):
+        limiter.slow_down()  # 1 -> 2 -> 4 -> 8 -> 16 -> 32 ms
+    cut = loop.time()
+    await asyncio.gather(*tasks)
+    late = sorted(t for t in admitted if t > cut)
+    assert late, "no admissions after the cut"
+    # Every waiter still outstanding at the cut re-reserves behind cut + 32ms at 32ms
+    # spacing, so the k-th post-cut admission cannot run before cut + (k + 1) * 32ms.
+    # (Wake-ups are late, never early, so slot order is the invariant, not gaps.)
+    for k, at in enumerate(late):
+        assert at >= cut + (k + 1) * 0.032 - 0.0005, (k, at - cut)
