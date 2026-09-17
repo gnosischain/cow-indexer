@@ -55,13 +55,28 @@ TERMINAL_WORK_STATUSES = ("done", "dead", "unavailable_from_public_api")
 MAX_CONCURRENT_FINAL = 2
 
 # Extra settings for the retention DELETE, layered on the per-store FINAL settings:
-# bound the IN-set memory and force a synchronous lightweight delete so a batch is fully
-# applied (and its rows masked from the next SELECT) before the next batch is chosen —
-# which is what makes the drain terminate.
+# bound the IN-set memory and keep the delete synchronous so a batch is fully applied
+# (and its rows masked from the next SELECT) before the next batch is chosen — which is
+# what makes the drain terminate.
+#
+# Do NOT set lightweight_delete_mode here. Forcing 'lightweight_update_force' needs the
+# target table to carry a block-number column (enable_block_number_column), which
+# work_items does not, so ClickHouse Cloud rejects the statement outright:
+#
+#   Code: 344. DB::Exception: Setting lightweight_delete_mode='lightweight_update_force'
+#   but cannot execute query 'DELETE FROM cow_db.work_items WHERE ...'
+#
+# A rejected DELETE deletes nothing, so retention stopped completely while the sweep
+# loop merely counted failures and backed off to its 1-hour ceiling. Measured on the
+# live pod 2026-09-17: cow_purge_sweeps_total{status="error"}=2 and zero successes,
+# against 951,408 work_items rows / 710,098 distinct items. Probed against the warehouse
+# the same day: sync=2, sync=1, sync=0 and no settings at all all succeed; only the
+# forced mode fails. The server's own default mode ('alter_update') is what we want, and
+# lightweight_deletes_sync=2 is already the server default — kept explicit because the
+# drain's termination depends on it rather than on a server-side default we do not own.
 PURGE_DELETE_SETTINGS = {
     "max_rows_in_set": 50_000,
     "max_bytes_in_set": 64 * 1024 * 1024,
-    "lightweight_delete_mode": "lightweight_update_force",
     "lightweight_deletes_sync": 2,
 }
 

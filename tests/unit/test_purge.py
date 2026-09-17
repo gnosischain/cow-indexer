@@ -67,6 +67,10 @@ async def test_purge_selects_bounded_then_deletes_all_versions() -> None:
     assert "('id1','id2')" in delete_sql
     assert delete_settings == store._purge_settings
     assert delete_settings["lightweight_deletes_sync"] == 2
+    # Never force a lightweight_delete_mode: 'lightweight_update_force' requires a
+    # block-number column work_items does not have, and ClickHouse rejects the whole
+    # statement (code 344) rather than degrading — retention then silently stops.
+    assert "lightweight_delete_mode" not in delete_settings
 
 
 # ClickHouse's default max_query_size. The retention DELETE is POSTed as the request
@@ -170,6 +174,9 @@ def test_final_settings_defaults() -> None:
     assert store._purge_settings["max_threads"] == 2
     assert store._purge_settings["lightweight_deletes_sync"] == 2
     assert store._purge_settings["max_rows_in_set"] == 50_000
+    # The retention DELETE must carry only settings this server accepts; a forced
+    # lightweight_delete_mode makes every sweep raise and delete nothing.
+    assert "lightweight_delete_mode" not in store._purge_settings
 
 
 @pytest.mark.asyncio
@@ -268,3 +275,21 @@ async def test_enqueue_is_async_ack_but_lease_and_finish_stay_durable() -> None:
     assert client.calls[-1] == ("cow_db.work_items", None), "finish must be durable"
     await store.release_work([item])
     assert client.calls[-1] == ("cow_db.work_items", None), "release must be durable"
+
+
+@pytest.mark.asyncio
+async def test_purge_delete_carries_no_unsupported_setting() -> None:
+    """Regression for the silent retention outage of 2026-09-17.
+
+    The sweep set lightweight_delete_mode='lightweight_update_force'. work_items has no
+    block-number column, so ClickHouse refused the statement with code 344 and deleted
+    nothing; the loop counted the failure, backed off to an hour, and retention stopped
+    while work_items grew to 951K rows. Assert the statement carries no delete-mode
+    override at all, so it runs under the server's own supported default.
+    """
+    fake = _FakeClient(query_rows=[[["id1"], ["id2"]]])
+    store = _store(fake)
+    await store.purge_finished_work(_chain(), datetime(2026, 1, 1, tzinfo=UTC), batch=10)
+    assert fake.commands, "no DELETE was issued"
+    for _, _, settings in fake.commands:
+        assert "lightweight_delete_mode" not in settings
