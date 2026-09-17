@@ -21,7 +21,7 @@ from cow_indexer.models import (
     RpcLog,
     WorkItem,
 )
-from cow_indexer.observability import ROWS_WRITTEN
+from cow_indexer.observability import REQUEST_LATENCY, ROWS_WRITTEN
 from cow_indexer.storage.migrations import migration_files, quote_database, split_sql
 from cow_indexer.utils import (
     canonical_json,
@@ -243,25 +243,32 @@ class ClickHouseStore:
         await self._ensure()
         columns = list(rows[0])
         data = [[row[column] for column in columns] for row in rows]
-        for attempt in range(1, INSERT_ATTEMPTS + 1):
-            try:
-                await self.client.insert(
-                    f"{self.database}.{table}", data, column_names=columns
-                )
-                break
-            except DatabaseError as exc:
-                # See _is_burned_insert_body: the driver ate our request body retrying a
-                # reset keep-alive connection. Nothing was written; send it again.
-                if attempt == INSERT_ATTEMPTS or not _is_burned_insert_body(exc):
-                    raise
-                log.warning(
-                    "clickhouse_insert_body_retry",
-                    table=table,
-                    rows=len(rows),
-                    attempt=attempt,
-                )
-                await asyncio.sleep(0.25 * attempt)
         chain = str(rows[0].get("chain_id", "none"))
+        # Timed under source="clickhouse", wrapping the whole retry loop so a burned-body
+        # retry's cost is counted too. On 2026-09-17 a mainnet enrichment item cost ~213
+        # worker-seconds against 0.5s of measured API time (3.9 calls x 0.136s); the ~10
+        # inserts an order_uid item performs were the largest cost nothing measured, and
+        # ClickHouse Cloud part-creation backpressure under ~176 concurrent writers is
+        # invisible without this.
+        with REQUEST_LATENCY.labels("clickhouse", chain).time():
+            for attempt in range(1, INSERT_ATTEMPTS + 1):
+                try:
+                    await self.client.insert(
+                        f"{self.database}.{table}", data, column_names=columns
+                    )
+                    break
+                except DatabaseError as exc:
+                    # See _is_burned_insert_body: the driver ate our request body retrying
+                    # a reset keep-alive connection. Nothing was written; send it again.
+                    if attempt == INSERT_ATTEMPTS or not _is_burned_insert_body(exc):
+                        raise
+                    log.warning(
+                        "clickhouse_insert_body_retry",
+                        table=table,
+                        rows=len(rows),
+                        attempt=attempt,
+                    )
+                    await asyncio.sleep(0.25 * attempt)
         ROWS_WRITTEN.labels(chain, table).inc(len(rows))
 
     async def store_raw_logs(self, chain: ChainConfig, logs: list[RpcLog]) -> None:

@@ -42,12 +42,18 @@ class AsyncRateLimiter:
         self._next = 0.0
 
     async def wait(self) -> None:
+        # Timed under source="limiter": this lock is shared by every worker on every chain
+        # and is held WHILE sleeping, so with N waiters each call queues behind N-1 others.
+        # At 16 workers x 11 chains that is ~176 contenders; queueing here is the prime
+        # suspect for the ~212s/item gap measured on 2026-09-17, and the transport-only
+        # "api" timing cannot see it.
         loop = asyncio.get_running_loop()
-        async with self._lock:
-            delay = self._next - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._next = loop.time() + self.interval_seconds
+        with REQUEST_LATENCY.labels("limiter", "all").time():
+            async with self._lock:
+                delay = self._next - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._next = loop.time() + self.interval_seconds
 
     def slow_down(self, factor: float = 2.0) -> None:
         self.interval_seconds = min(
