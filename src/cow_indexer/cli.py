@@ -404,6 +404,16 @@ def backfill_orderbook_seed_orders(
     batch_size: Annotated[
         int, typer.Option("--batch-size", min=1, max=UID_BATCH_SIZE)
     ] = UID_BATCH_SIZE,
+    since_days: Annotated[
+        int | None,
+        typer.Option(
+            "--since-days",
+            min=1,
+            help="Only consider trades from the last N days. Required for periodic "
+            "sweeps: unbounded, the anti-join sets every order ever seen and is "
+            "OOM-killed on a busy warehouse. Omit only for the one-off full seed.",
+        ),
+    ] = None,
     config: ConfigOption = DEFAULT_CONFIG,
 ) -> None:
     """Enqueue order_uids_batch items for traded uids missing from `orders`
@@ -414,7 +424,11 @@ def backfill_orderbook_seed_orders(
         try:
             output = []
             for selected in indexer_config.select(chain):
-                output.append(await service.seed_orders(selected, limit, batch_size))
+                output.append(
+                    await service.seed_orders(
+                        selected, limit, batch_size, since_days=since_days
+                    )
+                )
             _print(output)
         finally:
             await store.close()

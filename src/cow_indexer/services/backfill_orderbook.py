@@ -134,11 +134,15 @@ class BackfillOrderbookService:
         chain: ChainConfig,
         limit: int | None = None,
         batch_size: int = UID_BATCH_SIZE,
+        since_days: int | None = None,
     ) -> dict[str, Any]:
         """Enqueue one ``order_uids_batch`` item per <=batch_size traded uids missing
         from `orders`. The anti-join runs SQL-side (see
         stream_missing_traded_order_uids) and the stream arrives newest embedded
-        validTo first, so the drain extends coverage contiguously backward."""
+        validTo first, so the drain extends coverage contiguously backward.
+
+        Periodic sweeps must pass ``since_days``: unbounded, the anti-join builds a set
+        of every order ever seen and is OOM-killed on a busy warehouse."""
         if not 1 <= batch_size <= UID_BATCH_SIZE:
             raise ValueError(f"batch_size must be within 1..{UID_BATCH_SIZE}")
         seeded = 0
@@ -158,7 +162,9 @@ class BackfillOrderbookService:
             seeded += len(batch)
             batches += 1
 
-        async for block in self.store.stream_missing_traded_order_uids(chain, limit):
+        async for block in self.store.stream_missing_traded_order_uids(
+            chain, limit, since_days=since_days
+        ):
             buffer.extend(block)
             while len(buffer) >= batch_size:
                 take_batch(buffer[:batch_size])
@@ -170,7 +176,9 @@ class BackfillOrderbookService:
         await flush_items()
 
         already_covered: int | None = None
-        if limit is None:
+        # The all-time traded total only means something against an all-time seed. A
+        # windowed seed counted against it would report a meaningless "skipped" figure.
+        if limit is None and since_days is None:
             total = await self.store.count_distinct_traded_order_uids(chain)
             already_covered = max(0, total - seeded)
         result = {

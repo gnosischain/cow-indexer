@@ -93,19 +93,23 @@ class FakeStore:
         self.total_traded = total_traded
         self.lease_batches = list(lease_batches or [])
         self.stream_limits: list[int | None] = []
+        self.stream_since_days: list[int | None] = []
+        self.count_calls = 0
         self.enqueued: list[tuple[str, str, dict | None]] = []
         self.enqueue_calls = 0
         self.leases: list[tuple[str, int, tuple[str, ...] | None]] = []
         self.finished: list[tuple[str, bool, Any, dict]] = []
         self.stored: list[tuple[list[str], str]] = []
 
-    async def stream_missing_traded_order_uids(self, chain, limit=None):
+    async def stream_missing_traded_order_uids(self, chain, limit=None, since_days=None):
         self.stream_limits.append(limit)
+        self.stream_since_days.append(since_days)
         uids = self.missing_uids[:limit] if limit is not None else self.missing_uids
         for start in range(0, len(uids), 7):  # odd block size exercises the buffer
             yield uids[start : start + 7]
 
     async def count_distinct_traded_order_uids(self, chain):
+        self.count_calls += 1
         return self.total_traded
 
     async def distinct_trade_owners(self, chain, limit=None):
@@ -201,6 +205,29 @@ async def test_seed_orders_passes_limit_and_skips_total_count() -> None:
     assert result["seeded_uids"] == 5
     assert result["batches"] == 2
     assert result["skipped_existing"] is None  # not attributable under a --limit
+
+
+@pytest.mark.asyncio
+async def test_seed_orders_threads_since_days_and_skips_all_time_count() -> None:
+    # A windowed seed must reach the store, and must NOT subtract itself from the
+    # all-time traded total: that would report a meaningless "skipped" figure, and the
+    # all-time count is itself a full scan of trades.
+    store = FakeStore(missing_uids=[uid(index) for index in range(10)], total_traded=999)
+    result = await service(store).seed_orders(_chain(), batch_size=4, since_days=7)
+    assert store.stream_since_days == [7]
+    assert store.count_calls == 0
+    assert result["seeded_uids"] == 10
+    assert result["skipped_existing"] is None
+
+
+@pytest.mark.asyncio
+async def test_seed_orders_full_seed_still_counts_all_time() -> None:
+    # The one-off full seed keeps its existing behaviour exactly.
+    store = FakeStore(missing_uids=[uid(index) for index in range(10)], total_traded=25)
+    result = await service(store).seed_orders(_chain(), batch_size=4)
+    assert store.stream_since_days == [None]
+    assert store.count_calls == 1
+    assert result["skipped_existing"] == 15
 
 
 @pytest.mark.asyncio
@@ -401,6 +428,61 @@ async def test_stream_missing_uids_anti_joins_and_orders_newest_first() -> None:
     assert f"ORDER BY {ORDER_UID_VALID_TO_SQL} DESC, order_uid" in sql  # newest first
     assert "LIMIT" in sql
     assert parameters["limit"] == 3
+
+
+@pytest.mark.asyncio
+async def test_unwindowed_seed_sql_is_byte_identical_to_before_since_days() -> None:
+    # The one-off full seed must be unaffected by the sweep's window. Pin the exact SQL
+    # the unwindowed path produced before `since_days` existed, so a refactor of the
+    # windowed branch cannot quietly change what the full seed runs.
+    client = _FakeQueryClient(stream_blocks=[])
+    store = _real_store(client)
+    [_ async for _ in store.stream_missing_traded_order_uids(_chain(), limit=3)]
+
+    db = store.quoted_database
+    expected = (
+        f"SELECT order_uid FROM {db}.trades "
+        "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+        "AND order_uid NOT IN ("
+        f"SELECT order_uid FROM {db}.orders "
+        "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64}) "
+        "GROUP BY order_uid "
+        f"ORDER BY {ORDER_UID_VALID_TO_SQL} DESC, order_uid"
+        " LIMIT {limit:UInt64}"
+    )
+    sql, parameters = client.stream_queries[0]
+    assert sql == expected
+    assert "since_days" not in parameters
+
+
+@pytest.mark.asyncio
+async def test_windowed_sweep_bounds_orders_by_uid_set_not_by_time() -> None:
+    # The periodic sweep's fix. Unbounded, the NOT IN set held every order ever seen
+    # (4.8M on chain 1) and was OOM-killed in all four daily slots. The window must
+    # bound BOTH sides -- but `orders` by the recent uid SET, never by `creation_date`:
+    # orders fill long after creation (measured p99.9 18 days, max 307), so a time
+    # bound would report recent fills of old orders as missing and re-seed them forever.
+    client = _FakeQueryClient(stream_blocks=[[(uid(1),)]])
+    store = _real_store(client)
+    blocks = [
+        block
+        async for block in store.stream_missing_traded_order_uids(
+            _chain(), limit=2000, since_days=7
+        )
+    ]
+
+    assert blocks == [[uid(1)]]
+    sql, parameters = client.stream_queries[0]
+    assert parameters["since_days"] == 7
+    assert parameters["limit"] == 2000
+    # trades is bounded by time...
+    assert "block_timestamp >= now() - toIntervalDay({since_days:UInt32})" in sql
+    # ...and orders by the uid set that time bound produced, so the set stays small.
+    assert "order_uid IN (SELECT order_uid FROM recent)" in sql
+    # Never by creation_date: that is the false-positive trap described above.
+    assert "creation_date" not in sql
+    # Ordering and the limit are unchanged, so batch composition stays deterministic.
+    assert sql.endswith(f"ORDER BY {ORDER_UID_VALID_TO_SQL} DESC, order_uid LIMIT {{limit:UInt64}}")
 
 
 @pytest.mark.asyncio

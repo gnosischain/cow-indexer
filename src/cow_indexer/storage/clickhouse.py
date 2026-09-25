@@ -1472,29 +1472,63 @@ class ClickHouseStore:
         return [(row[0], row[1]) for row in result.result_rows]
 
     async def stream_missing_traded_order_uids(
-        self, chain: ChainConfig, limit: int | None = None
+        self,
+        chain: ChainConfig,
+        limit: int | None = None,
+        since_days: int | None = None,
     ) -> AsyncIterator[list[str]]:
         """Stream blocks of distinct traded order uids that are absent from `orders`,
         newest embedded validTo first (with a uid tiebreaker so the stream order — and
         therefore the seeder's batch composition and work_ids — is deterministic).
 
-        The anti-join runs SQL-side: pre-backfill `orders` is small (~100K rows per
-        chain), so the NOT IN hash set is cheap server-side, and it saves shipping
-        millions of trade uids to the client only to discard most of them on re-seeds.
-        As the backfill lands, `orders` converges on the traded-uid set and the same
-        query shrinks toward zero output — re-seeding stays cheap in rows even though
-        the set grows. Blocks are fetched lazily (query_row_block_stream), so client
-        memory stays bounded even for the ~4M-uid mainnet seed."""
+        The anti-join runs SQL-side, which saves shipping millions of trade uids to the
+        client only to discard most of them. Blocks are fetched lazily
+        (query_row_block_stream), so CLIENT memory stays bounded. SERVER memory does
+        not: the `NOT IN` subquery is a set build (CreatingSetsTransform), which has no
+        spill, and `max_bytes_before_external_group_by` / `_sort` do not bound it.
+
+        That used to be fine because pre-backfill `orders` held ~100K rows per chain.
+        Once the backfill landed it did not stay small — measured 2026-09-25: 4.8M
+        distinct uids on chain 1 and 2.8M on chain 100, making the set ~1 GiB. The
+        6-hourly sweep was then killed by the OvercommitTracker (Code 241 `(total)`) in
+        all four daily slots, whether or not dbt was running, and a `LIMIT` does not
+        help because it applies after the GROUP BY and ORDER BY.
+
+        So pass ``since_days`` for any periodic run. It bounds BOTH sides: `trades` by
+        time, and `orders` by the resulting uid SET rather than by time. Bounding
+        `orders` on `creation_date` would be wrong: orders are filled long after they
+        are created (measured: p99.9 18 days, max 307 days), so a recent fill of an old
+        order would be falsely reported missing and re-seeded every sweep. The uid-set
+        bound is exact for any order age. With 7 days it reads ~30K uids and peaks at
+        ~210 MiB, against ~1 GiB unbounded.
+
+        Leave ``since_days`` unset only for the one-off full seed, which genuinely
+        needs every traded uid; that path is unchanged."""
         await self._ensure()
-        sql = (
-            f"SELECT order_uid FROM {self.quoted_database}.trades "
-            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
-            "AND order_uid NOT IN ("
-            f"SELECT order_uid FROM {self.quoted_database}.orders "
-            "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64}) "
-            "GROUP BY order_uid "
-            f"ORDER BY {ORDER_UID_VALID_TO_SQL} DESC, order_uid"
-        )
+        if since_days is None:
+            sql = (
+                f"SELECT order_uid FROM {self.quoted_database}.trades "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                "AND order_uid NOT IN ("
+                f"SELECT order_uid FROM {self.quoted_database}.orders "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64}) "
+                "GROUP BY order_uid "
+                f"ORDER BY {ORDER_UID_VALID_TO_SQL} DESC, order_uid"
+            )
+        else:
+            sql = (
+                "WITH recent AS ("
+                f"SELECT order_uid FROM {self.quoted_database}.trades "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                "AND block_timestamp >= now() - toIntervalDay({since_days:UInt32}) "
+                "GROUP BY order_uid) "
+                "SELECT order_uid FROM recent "
+                "WHERE order_uid NOT IN ("
+                f"SELECT order_uid FROM {self.quoted_database}.orders "
+                "WHERE environment = {environment:String} AND chain_id = {chain_id:UInt64} "
+                "AND order_uid IN (SELECT order_uid FROM recent)) "
+                f"ORDER BY {ORDER_UID_VALID_TO_SQL} DESC, order_uid"
+            )
         if limit is not None:
             sql += " LIMIT {limit:UInt64}"
         parameters: dict[str, Any] = {
@@ -1503,6 +1537,8 @@ class ClickHouseStore:
         }
         if limit is not None:
             parameters["limit"] = limit
+        if since_days is not None:
+            parameters["since_days"] = since_days
         stream = await self.client.query_row_block_stream(
             sql, parameters=parameters, settings=self._seed_scan_settings
         )
