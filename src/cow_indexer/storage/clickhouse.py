@@ -1163,29 +1163,34 @@ class ClickHouseStore:
         return [row[0] for row in result.result_rows]
 
     async def known_tokens(self, chain: ChainConfig, limit: int = 500) -> list[str]:
+        # No FINAL: the result is a SET of token addresses, and an order's or trade's
+        # sell/buy token never differs between its ReplacingMergeTree(observed_at)
+        # versions (no is_deleted column either), so unmerged duplicates cannot change
+        # the set. The four FINALs cost ~0.9 GiB per call and ran several times a
+        # minute across chains -- they were the cow share of the warehouse saturation
+        # that failed the 2026-10-01 dbt run. Still memory-capped; no FINAL gate needed.
         await self._ensure()
-        async with self._final_gate():
-            result = await self.client.query(
-                f"SELECT token FROM ("
-                f"SELECT sell_token AS token FROM {self.quoted_database}.orders FINAL "
-                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
-                "UNION DISTINCT "
-                f"SELECT buy_token AS token FROM {self.quoted_database}.orders FINAL "
-                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
-                "UNION DISTINCT "
-                f"SELECT sell_token AS token FROM {self.quoted_database}.trades FINAL "
-                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
-                "UNION DISTINCT "
-                f"SELECT buy_token AS token FROM {self.quoted_database}.trades FINAL "
-                "WHERE environment={environment:String} AND chain_id={chain_id:UInt64}) "
-                "WHERE token != '' LIMIT {limit:UInt32}",
-                parameters={
-                    "environment": chain.environment,
-                    "chain_id": chain.chain_id,
-                    "limit": limit,
-                },
-                settings=self._final_settings,
-            )
+        result = await self.client.query(
+            f"SELECT token FROM ("
+            f"SELECT sell_token AS token FROM {self.quoted_database}.orders "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "UNION DISTINCT "
+            f"SELECT buy_token AS token FROM {self.quoted_database}.orders "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "UNION DISTINCT "
+            f"SELECT sell_token AS token FROM {self.quoted_database}.trades "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64} "
+            "UNION DISTINCT "
+            f"SELECT buy_token AS token FROM {self.quoted_database}.trades "
+            "WHERE environment={environment:String} AND chain_id={chain_id:UInt64}) "
+            "WHERE token != '' LIMIT {limit:UInt32}",
+            parameters={
+                "environment": chain.environment,
+                "chain_id": chain.chain_id,
+                "limit": limit,
+            },
+            settings=self._final_settings,
+        )
         return [row[0] for row in result.result_rows]
 
     async def tokens_with_fresh_price(
